@@ -29,7 +29,7 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
 FROM gcr.io/distroless/static-debian12:nonroot
 ARG APP
 LABEL org.opencontainers.image.title="jobscheduler-${APP}" \
-      org.opencontainers.image.source="https://github.com/vasistamagam/distributed-jobscheduler"
+      org.opencontainers.image.source="https://github.com/tobi6903/Distributed-jobschedular"
 COPY --from=build /out/app /app
 # Numeric uid so Kubernetes can verify runAsNonRoot without resolving a name.
 USER 65532:65532

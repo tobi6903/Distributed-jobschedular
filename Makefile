@@ -13,7 +13,7 @@ BIN       := bin
 CMDS      := api worker scheduler jobctl
 COMPOSE   := docker compose -f deploy/docker/docker-compose.yml
 IMAGE_TAG ?= dev
-REGISTRY  ?= ghcr.io/vasistamagam/distributed-jobscheduler
+REGISTRY  ?= ghcr.io/tobi6903/distributed-jobschedular
 API_URL   ?= http://localhost:8080
 # Integration tests need Postgres: either set TEST_DATABASE_URL (admin connection string) or
 # have Docker running so testcontainers can start one. `make test-db` starts a local container.

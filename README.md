@@ -223,7 +223,7 @@ The Helm chart ([deploy/helm/jobscheduler](deploy/helm/jobscheduler)) provides: 
 ```bash
 # kind demo with an in-cluster demo Postgres (never use that in production)
 helm install js deploy/helm/jobscheduler --namespace jobs --create-namespace \
-  --set postgresql.enabled=true --set image.registry=ghcr.io/<you>/distributed-jobscheduler --set image.tag=<tag>
+  --set postgresql.enabled=true --set image.tag=<tag>      # images default to ghcr.io/tobi6903/distributed-jobschedular
 ```
 
 GitOps with Argo CD: [deploy/argocd](deploy/argocd). CI builds and scans images and commits the new tag to `values-prod.yaml`; Argo CD syncs it; rollback is `git revert`.
@@ -262,7 +262,7 @@ Everything below was executed, on Linux with Docker 29, a 3-node kind cluster (K
 
 | Verified by running it | Not verified |
 |---|---|
-| **The full test suite (220 tests, 0 skipped) through testcontainers with `-race`**, including 50 workers x 100k jobs | The GitHub Actions workflows actually running (they pass `actionlint`, and every `uses:` tag was checked to exist) |
+| **The full test suite (220 tests, 0 skipped) through testcontainers with `-race`**, including 50 workers x 100k jobs | The `images` job end to end: the Trivy gate failed on the first CI run (a misconfigured gate, not a vulnerability, see below), is fixed, and has not run again yet; so the push to GHCR and the GitOps tag commit (`promote`) are unproven |
 | **The four images**: BuildKit build, non-root, no shell, 22 to 35 MB, **Trivy: 0 fixable HIGH/CRITICAL** | A managed cloud Kubernetes, a real ingress controller, an external database and real secret management (the kind cluster uses an in-cluster demo Postgres) |
 | **The full Compose stack**: `make smoke` passes (retry, cron, Prometheus scrapes all replicas, one scheduler leads, one trace spans the API and worker containers in Tempo); all 25 rules healthy; all 28 dashboard panels' queries run; JSON logs reach Loki | Grafana against a real Kubernetes cluster (dashboards and screenshots come from the Compose stack) |
 | **Graceful `docker stop`** mid-job (exit 0, jobs finish on attempt 1); **container chaos** (`make chaos-docker`, 11 to 14 SIGKILLs: 0 jobs lost, 0 cron duplicates, 0 gaps) | The API HPA actually scaling out (its CPU metric is read correctly, but no load pushed it over target) |
@@ -270,6 +270,8 @@ Everything below was executed, on Linux with Docker 29, a 3-node kind cluster (K
 | **GitOps** (`make argocd-verify`): Argo CD deploys the chart from git (my real `AppProject` whitelist and `Application`), **heals manual drift**, **rolls out a commit** and **rolls back on `git revert`** | |
 | k6 against the containerized stack at 300 jobs/s: submit p95 20 ms, p99 111 ms, 0 failures | |
 | `golangci-lint` v2, `helm lint`, `kubeconform`, `promtool check` and **12 `promtool test rules` test cases**, `amtool`, `hadolint`, `actionlint` (`make validate`) | |
+
+**On GitHub Actions (first real run of the workflows):** `test` (220 tests, `-race`), `lint` (`golangci-lint` v2), `chart` (`helm lint`, `kubeconform`, `promtool`, `amtool`, `hadolint`, compose validation) and `smoke` (the Compose stack with its chaos run) **passed**, and the **Kubernetes workflow passed end to end** (kind, KEDA, the full `k8s-verify` suite including crash chaos, rolling-deploy drain, node drain and NetworkPolicy, then the Argo CD GitOps check). The four `images` jobs failed at the Trivy step. Cause: the action ignores the severity filter for SARIF output unless `limit-severities-for-sarif` is set, so harmless `UNKNOWN`-severity Debian advisories (`tzdata`, `ca-certificates` in the base image) failed a gate meant for fixable HIGH/CRITICAL findings, and the findings were hidden inside the SARIF file. The step is now a non-failing full report to code scanning plus a gate that prints its findings.
 
 `make validate` runs the checks that need no container runtime; `make smoke` / `make chaos-docker` run against `make up`; `make kind-up`, `make k8s-verify` and `make argocd-verify` run against kind ([deploy/kind/README.md](deploy/kind/README.md)).
 

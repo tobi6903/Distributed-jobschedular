@@ -392,6 +392,14 @@ That run found real defects, none visible before. They are worth listing because
 | First run of the committed verify script | `wait_for ... test "$(cmd)" = x` evaluates `$(cmd)` once, so it polled a frozen value; and cron `noop` jobs broke a job count | `wait_eq` re-runs the command each poll; counts filter by type |
 | Argo CD | A busybox "dumb HTTP" git server is unreadable by Argo's git library | Test repo is served with `git daemon` |
 
+**The first real GitHub Actions run** (after pushing) passed `test`, `lint`, `chart`, `smoke` and the whole Kubernetes workflow, and found three more things:
+
+| Found by | Defect | Fix |
+|---|---|---|
+| The `images` jobs | **The Trivy gate was misconfigured.** `trivy-action` ignores `severity` for `format: sarif` unless `limit-severities-for-sarif` is set, so four `UNKNOWN`-severity Debian LTS advisories (`tzdata` x3, `ca-certificates`, all with fixes already published, in the distroless base) failed a gate meant for fixable HIGH/CRITICAL findings. The findings were also invisible: SARIF output goes to a file, not the log | Two steps: a non-failing report of every severity to code scanning, and a gate (`format: table`, HIGH/CRITICAL, ignore-unfixed) that prints what it finds |
+| The repository's first minutes | The `dependabot.yml` I wrote opened **ten pull requests at once**, each starting the full pipeline and queueing the real run behind them | Grouped updates, weekly, capped open PRs |
+| Reading the CI log | The Trivy local scan I had run was clean only because my local vulnerability database cache was stale (and could not be deleted: root-owned) | Always scan with a fresh cache directory; the fresh scan reproduced CI's four findings exactly |
+
 Verified on the cluster: KEDA scaling up (2 -> 4 -> 8) and down (8 -> 6 -> 4 -> 2); crash recovery (0 lost, cron exact); rolling deploys that drain in-flight jobs; forced release of jobs longer than the grace (attempt refunded); node drains that respect PodDisruptionBudgets; NetworkPolicy blocking and allowing; Argo CD deploying the chart, healing drift, rolling out a commit and rolling back on `git revert`.
 
-Still unverified: the GitHub Actions workflows running; a managed cloud cluster, real ingress controller, external database and secret manager; the API HPA scaling out under load.
+Still unverified: the `images` workflow job after the Trivy fix (push to GHCR and the GitOps `promote` commit); a managed cloud cluster, real ingress controller, external database and secret manager; the API HPA scaling out under load.

@@ -11,7 +11,7 @@ metadata:
 spec:
   project: jobscheduler
   source:
-    repoURL: https://github.com/vasistamagam/distributed-jobscheduler.git
+    repoURL: https://github.com/tobi6903/Distributed-jobschedular.git
     targetRevision: main
     path: deploy/helm/jobscheduler
     helm:
