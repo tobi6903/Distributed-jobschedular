@@ -1,0 +1,28 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: jobscheduler
+  namespace: argocd
+spec:
+  description: Distributed job scheduler
+  sourceRepos:
+    - https://github.com/vasistamagam/distributed-jobscheduler.git
+  destinations:
+    - namespace: jobs
+      server: https://kubernetes.default.svc
+  # Only the kinds this chart needs, so a bad commit cannot create cluster-scoped resources.
+  clusterResourceWhitelist: []
+  namespaceResourceWhitelist:
+    - {group: "", kind: ServiceAccount}
+    - {group: "", kind: Service}
+    - {group: "", kind: Secret}
+    - {group: apps, kind: Deployment}
+    - {group: apps, kind: StatefulSet}
+    - {group: batch, kind: Job}
+    - {group: policy, kind: PodDisruptionBudget}
+    - {group: autoscaling, kind: HorizontalPodAutoscaler}
+    - {group: networking.k8s.io, kind: NetworkPolicy}
+    - {group: networking.k8s.io, kind: Ingress}
+    - {group: keda.sh, kind: ScaledObject}
+    - {group: keda.sh, kind: TriggerAuthentication}
+    - {group: monitoring.coreos.com, kind: ServiceMonitor}

@@ -1,0 +1,9 @@
+# Local Kubernetes for verifying the chart: one control plane and two workers, so PodDisruptionBudgets,
+# node drains and topology spread have something to act on.
+#   kind create cluster --name js --config deploy/kind/kind-config.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker

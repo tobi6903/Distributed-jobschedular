@@ -1,0 +1,36 @@
+# Alertmanager routing. Receivers are webhooks to a placeholder; point them at Slack,
+# PagerDuty, Opsgenie, etc. (secrets belong in the environment or a secret manager, never here).
+route:
+  receiver: default
+  group_by: [alertname, queue]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers: [severity="critical"]
+      receiver: pager
+      group_wait: 10s
+      repeat_interval: 1h
+    - matchers: [severity="info"]
+      receiver: default
+      repeat_interval: 24h
+
+receivers:
+  - name: default
+    webhook_configs:
+      - url: http://alert-sink:5001/default
+        send_resolved: true
+  - name: pager
+    webhook_configs:
+      - url: http://alert-sink:5001/pager
+        send_resolved: true
+
+inhibit_rules:
+  # If the whole API is down, don't also page about its latency.
+  - source_matchers: [alertname="PostgresUnreachableFromAPI"]
+    target_matchers: [alertname=~"APIHighLatency|APIAvailabilitySLOFastBurn"]
+    equal: []
+  # A critical backlog alert makes the warning-level one redundant.
+  - source_matchers: [alertname="QueueOldestJobCritical"]
+    target_matchers: [alertname="QueueOldestJobTooOld"]
+    equal: [queue]

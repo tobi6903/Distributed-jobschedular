@@ -1,0 +1,15 @@
+Job scheduler installed as release "{{ .Release.Name }}".
+
+  API (cluster-internal):  http://{{ include "js.fullname" . }}-api.{{ .Release.Namespace }}.svc
+  Port-forward:            kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "js.fullname" . }}-api 8080:80
+
+Create a tenant API key (one time):
+  kubectl -n {{ .Release.Namespace }} run jobctl --rm -it --restart=Never \
+    --image={{ include "js.image" (dict "ctx" . "app" "jobctl") }} \
+    --env=DATABASE_URL="$(kubectl -n {{ .Release.Namespace }} get secret {{ include "js.secretName" . }} -o jsonpath='{.data.DATABASE_URL}' | base64 -d)" \
+    -- create-key -tenant demo
+
+Worker shutdown contract: terminationGracePeriodSeconds={{ include "js.workerTerminationGrace" . }} (max job timeout {{ .Values.worker.maxJobTimeoutSeconds }}s + 15s).
+{{- if .Values.keda.enabled }}
+Workers autoscale with KEDA on runnable backlog ({{ .Values.keda.jobsPerReplica }} jobs per replica, {{ .Values.keda.minReplicaCount }}-{{ .Values.keda.maxReplicaCount }} replicas).
+{{- end }}

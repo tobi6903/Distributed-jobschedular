@@ -1,0 +1,132 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $pg := .Values.networkPolicy.postgres }}
+{{- if and (not $pg.cidr) (not $pg.podSelector) }}
+{{- fail "networkPolicy.postgres.cidr or networkPolicy.postgres.podSelector must be set" }}
+{{- end }}
+# Default posture: every pod of this release denies all ingress and egress, then we allow only
+# what the system needs. A compromised pod cannot reach anything else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "js.fullname" . }}-default-deny
+  labels: {{- include "js.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/name: {{ include "js.name" . }}
+  policyTypes: [Ingress, Egress]
+---
+# Egress shared by api, worker and scheduler: DNS, Postgres, and (optionally) the OTLP collector.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "js.fullname" . }}-egress
+  labels: {{- include "js.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/name: {{ include "js.name" . }}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        {{- if $pg.cidr }}
+        - ipBlock:
+            cidr: {{ $pg.cidr }}
+        {{- else }}
+        - podSelector:
+            matchLabels: {{- toYaml $pg.podSelector | nindent 14 }}
+        {{- end }}
+      ports:
+        - {protocol: TCP, port: {{ $pg.port }}}
+    {{- if .Values.networkPolicy.otlpNamespaceLabels }}
+    - to:
+        - namespaceSelector:
+            matchLabels: {{- toYaml .Values.networkPolicy.otlpNamespaceLabels | nindent 14 }}
+      ports:
+        - {protocol: TCP, port: 4318}
+    {{- end }}
+{{- if .Values.postgresql.enabled }}
+---
+# Demo in-cluster Postgres: the default-deny above also covers it, so it needs an explicit allow. Without
+# this the app works only until its pods restart (existing connections survive a new policy, new ones
+# are refused), which is the worst time to find out. KEDA's operator queries the database too, from
+# its own namespace. A real (external) database is outside the cluster and not affected by this.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "js.fullname" . }}-postgres-ingress
+  labels: {{- include "js.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "js.selector" (dict "ctx" . "component" "postgres") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/instance
+                operator: In
+                values: [{{ .Release.Name }}]
+              - key: app.kubernetes.io/component
+                operator: In
+                values: [api, worker, scheduler, migrate]
+        {{- if .Values.keda.enabled }}
+        - namespaceSelector:
+            matchLabels: {{- toYaml .Values.networkPolicy.kedaNamespaceLabels | nindent 14 }}
+        {{- end }}
+      ports:
+        - {protocol: TCP, port: 5432}
+{{- end }}
+---
+# API: reachable from the ingress controller, and its /metrics from the monitoring namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "js.fullname" . }}-api-ingress
+  labels: {{- include "js.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "js.selector" (dict "ctx" . "component" "api") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {{- toYaml .Values.networkPolicy.ingressNamespaceLabels | nindent 14 }}
+        - namespaceSelector:
+            matchLabels: {{- toYaml .Values.networkPolicy.monitoringNamespaceLabels | nindent 14 }}
+      ports:
+        - {protocol: TCP, port: {{ .Values.api.port }}}
+---
+# Workers and schedulers accept no traffic except Prometheus scraping their metrics port.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "js.fullname" . }}-metrics-ingress
+  labels: {{- include "js.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values: [worker, scheduler]
+      - key: app.kubernetes.io/instance
+        operator: In
+        values: [{{ .Release.Name }}]
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {{- toYaml .Values.networkPolicy.monitoringNamespaceLabels | nindent 14 }}
+      ports:
+        - {protocol: TCP, port: {{ .Values.worker.metricsPort }}}
+        - {protocol: TCP, port: {{ .Values.scheduler.metricsPort }}}
+{{- end }}

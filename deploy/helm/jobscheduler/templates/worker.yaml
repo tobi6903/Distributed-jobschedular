@@ -1,0 +1,112 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "js.fullname" . }}-worker
+  labels: {{- include "js.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  {{- if not .Values.keda.enabled }}
+  replicas: {{ .Values.worker.replicas }}
+  {{- end }}
+  selector:
+    matchLabels: {{- include "js.selector" (dict "ctx" . "component" "worker") | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 25%
+      maxSurge: 25%
+  template:
+    metadata:
+      labels: {{- include "js.selector" (dict "ctx" . "component" "worker") | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "js.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      # Matched to the job timeout: after SIGTERM the worker stops claiming and drains for up to
+      # maxJobTimeoutSeconds; the extra 15s covers releasing stragglers and exiting. Kubernetes
+      # therefore never SIGKILLs a worker that is still legitimately finishing a job.
+      terminationGracePeriodSeconds: {{ include "js.workerTerminationGrace" . }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {{- include "js.selector" (dict "ctx" . "component" "worker") | nindent 14 }}
+      containers:
+        - name: worker
+          image: {{ include "js.image" (dict "ctx" . "app" "worker") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext: {{- include "js.containerSecurity" . | nindent 12 }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.worker.metricsPort }}
+          env:
+            {{- include "js.commonEnv" (dict "ctx" . "maxConns" .Values.worker.maxConns) | nindent 12 }}
+            - name: METRICS_ADDR
+              value: {{ printf ":%d" (int .Values.worker.metricsPort) | quote }}
+            - name: WORKER_QUEUES
+              value: {{ .Values.worker.queues | quote }}
+            - name: WORKER_CONCURRENCY
+              value: {{ .Values.worker.concurrency | quote }}
+            - name: WORKER_BATCH_SIZE
+              value: {{ .Values.worker.batchSize | quote }}
+            - name: WORKER_LEASE
+              value: {{ printf "%ds" (int .Values.worker.leaseSeconds) | quote }}
+            - name: WORKER_DEFAULT_TIMEOUT
+              value: {{ printf "%ds" (int .Values.worker.maxJobTimeoutSeconds) | quote }}
+            - name: WORKER_SHUTDOWN_GRACE
+              value: {{ printf "%ds" (int .Values.worker.maxJobTimeoutSeconds) | quote }}
+            - name: RETENTION
+              value: {{ .Values.worker.retention | quote }}
+            - name: BACKOFF_BASE
+              value: {{ .Values.worker.backoffBase | quote }}
+            - name: BACKOFF_CAP
+              value: {{ .Values.worker.backoffCap | quote }}
+          # Liveness only checks the process. If it also checked Postgres, a database blip would
+          # restart every worker at once and kill in-flight jobs.
+          livenessProbe:
+            httpGet: {path: /healthz, port: metrics}
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: {path: /healthz, port: metrics}
+            periodSeconds: 10
+          resources: {{- toYaml .Values.worker.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "js.fullname" . }}-worker
+  labels: {{- include "js.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  selector: {{- include "js.selector" (dict "ctx" . "component" "worker") | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.worker.metricsPort }}
+      targetPort: metrics
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "js.fullname" . }}-worker
+  labels: {{- include "js.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.worker.pdb.maxUnavailable | quote }}
+  selector:
+    matchLabels: {{- include "js.selector" (dict "ctx" . "component" "worker") | nindent 6 }}
