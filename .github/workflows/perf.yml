@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Start the stack
         run: |
           docker compose -f deploy/docker/docker-compose.yml up --build -d --wait postgres api worker scheduler
@@ -32,7 +32,7 @@ jobs:
       - uses: grafana/setup-k6-action@v1
       - name: k6
         run: k6 run -e API_URL=http://localhost:8080 -e API_KEY="$API_KEY" -e RATE=${{ inputs.rate }} -e DURATION=${{ inputs.duration }} --summary-export=k6-summary.json test/load/k6.js
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: k6-summary

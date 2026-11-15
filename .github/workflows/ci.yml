@@ -22,8 +22,8 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -55,8 +55,8 @@ jobs:
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
       REQUIRE_TEST_DB: "1"   # a missing database fails the build instead of skipping every test
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -67,7 +67,7 @@ jobs:
           for i in $(seq 30); do pg_isready -h localhost -U postgres && break; sleep 1; done
       # -race everywhere; includes the 50 workers x 100,000 jobs zero-duplicate / zero-loss test.
       - run: go test -race -count=1 -timeout 25m -coverprofile=coverage.out ./...
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: coverage.out
@@ -75,9 +75,9 @@ jobs:
   chart:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: helm lint
@@ -105,7 +105,7 @@ jobs:
         run: docker run --rm -v "$PWD/deploy/alertmanager:/a:ro" --entrypoint amtool prom/alertmanager:v0.27.0 check-config /a/alertmanager.yml
       - name: docker compose config
         run: docker compose -f deploy/docker/docker-compose.yml config -q
-      - uses: hadolint/hadolint-action@v3.1.0
+      - uses: hadolint/hadolint-action@v3.5.0
         with:
           dockerfile: deploy/docker/Dockerfile
 
@@ -115,8 +115,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
       - name: Start the stack
         run: docker compose -f deploy/docker/docker-compose.yml up --build -d --wait
       - name: Smoke test (retry, cron, Prometheus scrape, leader election, distributed trace)
@@ -142,10 +142,10 @@ jobs:
       matrix:
         app: [api, worker, scheduler, jobctl]
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE_PREFIX }}/${{ matrix.app }}
           tags: |
@@ -154,7 +154,7 @@ jobs:
             type=semver,pattern={{version}}
       # 1. Build into the local Docker daemon so it can be scanned before anything is pushed.
       - name: Build (local, for scanning)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: deploy/docker/Dockerfile
@@ -177,7 +177,7 @@ jobs:
           format: sarif
           output: trivy-${{ matrix.app }}.sarif
           exit-code: "0"
-      - uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@v4
         if: always() && hashFiles(format('trivy-{0}.sarif', matrix.app)) != ''
         continue-on-error: true   # code scanning is unavailable on some private repositories; the gate below still runs
         with:
@@ -194,14 +194,14 @@ jobs:
       # 3. Only if the scan passed, and only on main or a tag: push to GHCR (reusing the layer cache).
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Push
         if: github.event_name != 'pull_request'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: deploy/docker/Dockerfile
@@ -222,7 +222,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set image tag to this commit
         run: |
           sed -i "s|^  tag: .*|  tag: \"sha-${GITHUB_SHA}\"|" deploy/argocd/values-prod.yaml
