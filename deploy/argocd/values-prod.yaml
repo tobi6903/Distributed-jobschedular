@@ -1,0 +1,41 @@
+# Production overrides. CI updates image.tag on every merge to main.
+image:
+  tag: "0.1.0"
+
+database:
+  # Synced from your secret store (External Secrets Operator, Sealed Secrets, ...). The chart
+  # never stores the production connection string.
+  existingSecret: jobscheduler-db
+
+otlpEndpoint: http://tempo.monitoring.svc:4318
+
+api:
+  autoscaling:
+    minReplicas: 2
+    maxReplicas: 10
+  ingress:
+    enabled: true
+    className: nginx
+    host: jobs.example.com
+
+worker:
+  concurrency: 20
+  maxJobTimeoutSeconds: 300
+
+keda:
+  enabled: true
+  minReplicaCount: 2
+  maxReplicaCount: 40
+  jobsPerReplica: 100
+
+networkPolicy:
+  enabled: true
+  postgres:
+    cidr: 10.0.0.0/16        # your database subnet
+  otlpNamespaceLabels:
+    kubernetes.io/metadata.name: monitoring
+
+serviceMonitor:
+  enabled: true
+  labels:
+    release: kube-prometheus-stack

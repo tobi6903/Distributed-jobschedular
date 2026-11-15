@@ -1,0 +1,61 @@
+{{- if .Values.keda.enabled }}
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: {{ include "js.fullname" . }}-postgres
+  labels: {{- include "js.labels" . | nindent 4 }}
+spec:
+  secretTargetRef:
+    - parameter: connection
+      name: {{ include "js.secretName" . }}
+      key: DATABASE_URL
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "js.fullname" . }}-worker
+  labels: {{- include "js.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: {{ include "js.fullname" . }}-worker
+  minReplicaCount: {{ .Values.keda.minReplicaCount }}
+  maxReplicaCount: {{ .Values.keda.maxReplicaCount }}
+  pollingInterval: {{ .Values.keda.pollingIntervalSeconds }}
+  {{- if eq (int .Values.keda.minReplicaCount) 0 }}
+  # Only meaningful when scaling to zero. With minReplicaCount > 0 KEDA hands scaling to an HPA and
+  # ignores this (it warns if you set it), so scale-down speed is controlled by the behavior below.
+  cooldownPeriod: {{ .Values.keda.cooldownSeconds }}
+  {{- end }}
+  # If the Postgres scaler keeps failing, hold a safe replica count instead of collapsing to the minimum.
+  fallback:
+    failureThreshold: 3
+    replicas: {{ .Values.keda.fallbackReplicas }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 30
+        # Scale down slowly: each removed pod drains its in-flight jobs (up to the termination
+        # grace period), and flapping would churn leases.
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Pods
+              value: 2
+              periodSeconds: 60
+  triggers:
+    - type: postgresql
+      authenticationRef:
+        name: {{ include "js.fullname" . }}-postgres
+      metadata:
+        # Runnable backlog: what workers could be doing right now. Delayed jobs (run_at in the
+        # future) are excluded so they do not trigger scale-up before they are due. Served by
+        # the partial index jobs_claim_idx.
+        query: "SELECT count(*) FROM jobs WHERE queue = '{{ .Values.keda.queue }}' AND status IN ('pending','retrying') AND run_at <= now()"
+        targetQueryValue: {{ .Values.keda.jobsPerReplica | quote }}
+        activationTargetQueryValue: "1"
+{{- end }}

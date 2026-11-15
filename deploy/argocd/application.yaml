@@ -1,0 +1,38 @@
+# GitOps deployment: Argo CD watches this repository and keeps the cluster equal to it.
+#   kubectl apply -f deploy/argocd/project.yaml -f deploy/argocd/application.yaml
+# CI (see .github/workflows/ci.yml) builds images and commits the new tag to values-prod.yaml;
+# Argo CD notices the commit and rolls it out. Rollback is `git revert`.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: jobscheduler
+  namespace: argocd
+  finalizers: [resources-finalizer.argocd.argoproj.io]
+spec:
+  project: jobscheduler
+  source:
+    repoURL: https://github.com/vasistamagam/distributed-jobscheduler.git
+    targetRevision: main
+    path: deploy/helm/jobscheduler
+    helm:
+      releaseName: js
+      valueFiles:
+        - ../../argocd/values-prod.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: jobs
+  syncPolicy:
+    automated:
+      prune: true       # delete resources removed from git
+      selfHeal: true    # revert manual drift (kubectl edit)
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff: {duration: 10s, factor: 2, maxDuration: 3m}
+  # KEDA and the HPA own replica counts; without this Argo CD would see drift and fight them.
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers: [/spec/replicas]

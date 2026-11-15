@@ -1,0 +1,161 @@
+# Alert rules. Every alert has a runbook (docs/runbooks/) linked via the runbook_url annotation.
+groups:
+  # ---- SLO burn-rate alerts (multi-window, multi-burn-rate; see docs/SLO.md) ----
+  - name: jobscheduler-slo
+    rules:
+      # Pickup SLO: 99% of jobs claimed within 30s. Error budget = 1%.
+      # 14.4x burn over 1h (and 5m to confirm it is still happening) consumes 2% of a 30d budget.
+      - alert: JobPickupSLOFastBurn
+        expr: |
+          (1 - jobscheduler:pickup_within_30s:ratio_rate1h) > (14.4 * 0.01)
+          and
+          (1 - jobscheduler:pickup_within_30s:ratio_rate5m) > (14.4 * 0.01)
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Job pickup SLO is burning error budget 14x too fast"
+          description: "More than 14.4% of jobs waited over 30s to be picked up (1h and 5m windows)."
+          runbook_url: "docs/runbooks/queue-backlog.md"
+      - alert: JobPickupSLOSlowBurn
+        expr: |
+          (1 - jobscheduler:pickup_within_30s:ratio_rate6h) > (6 * 0.01)
+          and
+          (1 - jobscheduler:pickup_within_30s:ratio_rate30m) > (6 * 0.01)
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Job pickup SLO is burning error budget 6x too fast"
+          description: "More than 6% of jobs waited over 30s to be picked up (6h and 30m windows)."
+          runbook_url: "docs/runbooks/queue-backlog.md"
+      # Job success SLO: 99.5% of finished jobs do not dead-letter. Budget = 0.5%.
+      - alert: JobSuccessSLOFastBurn
+        expr: |
+          (1 - jobscheduler:job_success:ratio_rate1h) > (14.4 * 0.005)
+          and
+          (1 - jobscheduler:job_success:ratio_rate5m) > (14.4 * 0.005)
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Jobs are dead-lettering at 14x the error budget rate"
+          runbook_url: "docs/runbooks/high-failure-rate.md"
+      # API availability SLO: 99.9%. Budget = 0.1%.
+      - alert: APIAvailabilitySLOFastBurn
+        expr: |
+          (1 - jobscheduler:api_availability:ratio_rate1h) > (14.4 * 0.001)
+          and
+          (1 - jobscheduler:api_availability:ratio_rate5m) > (14.4 * 0.001)
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "API 5xx rate is burning the availability budget 14x too fast"
+          runbook_url: "docs/runbooks/api-errors.md"
+
+  # ---- Symptom and cause alerts ----
+  - name: jobscheduler-queue
+    rules:
+      - alert: QueueOldestJobTooOld
+        expr: max by (queue) (jobscheduler_oldest_ready_job_age_seconds) > 120
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Queue {{ $labels.queue }}: oldest ready job has waited {{ $value | humanizeDuration }}"
+          description: "Workers are not keeping up (or are down). Scale workers or investigate."
+          runbook_url: "docs/runbooks/queue-backlog.md"
+      - alert: QueueOldestJobCritical
+        expr: max by (queue) (jobscheduler_oldest_ready_job_age_seconds) > 900
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Queue {{ $labels.queue }}: oldest ready job has waited over 15 minutes"
+          runbook_url: "docs/runbooks/queue-backlog.md"
+      - alert: DeadLetterQueueNotEmpty
+        expr: max by (queue) (jobscheduler_dlq_size) > 0
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Queue {{ $labels.queue }} has {{ $value }} dead jobs"
+          description: "Inspect last_error, fix the cause, then replay with POST /jobs/{id}/replay."
+          runbook_url: "docs/runbooks/dead-letter-queue.md"
+      - alert: DeadLetterQueueGrowing
+        expr: sum by (queue) (delta(jobscheduler_dlq_size[15m])) > 50
+        labels: {severity: critical}
+        annotations:
+          summary: "Queue {{ $labels.queue }}: DLQ grew by {{ $value }} in 15m"
+          runbook_url: "docs/runbooks/dead-letter-queue.md"
+      - alert: HighRetryRate
+        expr: |
+          sum by (type) (rate(jobscheduler_job_retries_total[10m]))
+          /
+          sum by (type) (rate(jobscheduler_job_duration_seconds_count[10m])) > 0.2
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Over 20% of {{ $labels.type }} attempts are being retried"
+          runbook_url: "docs/runbooks/high-failure-rate.md"
+
+  - name: jobscheduler-workers
+    rules:
+      - alert: WorkerCrashesDetected
+        expr: sum(increase(jobscheduler_jobs_reaped_total[10m])) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value }} jobs were recovered from expired leases in the last 10m"
+          description: "A worker crashed, was OOM-killed, or lost connectivity to Postgres mid-job."
+          runbook_url: "docs/runbooks/worker-crashes.md"
+      - alert: NoWorkersUp
+        expr: sum(up{job="worker"}) == 0 or absent(up{job="worker"})
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "No worker is being scraped; jobs will not run"
+          runbook_url: "docs/runbooks/queue-backlog.md"
+
+  - name: jobscheduler-scheduler
+    rules:
+      - alert: NoSchedulerLeader
+        expr: sum(jobscheduler_scheduler_is_leader) == 0 or absent(jobscheduler_scheduler_is_leader)
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "No scheduler replica holds leadership; cron jobs are not firing"
+          runbook_url: "docs/runbooks/scheduler-leader.md"
+      - alert: MultipleSchedulerLeaders
+        expr: sum(jobscheduler_scheduler_is_leader) > 1
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "More than one scheduler reports leadership for 5m"
+          description: "Brief overlaps during failover are expected. A sustained overlap is a bug or a split brain. Fires stay exactly-once thanks to idempotent keys."
+          runbook_url: "docs/runbooks/scheduler-leader.md"
+      - alert: CronDuplicatePrevented
+        expr: sum(increase(jobscheduler_scheduler_fires_total{result="duplicate_prevented"}[1h])) > 0
+        labels: {severity: info}
+        annotations:
+          summary: "The idempotency key blocked a duplicate cron fire; the row-lock layer was bypassed"
+          runbook_url: "docs/runbooks/scheduler-leader.md"
+
+  - name: jobscheduler-api
+    rules:
+      - alert: APIHighLatency
+        expr: |
+          histogram_quantile(0.99, sum by (le) (rate(jobscheduler_http_request_duration_seconds_bucket{route="POST /jobs"}[5m]))) > 1
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "POST /jobs p99 latency is {{ $value | humanizeDuration }}"
+          runbook_url: "docs/runbooks/api-errors.md"
+      - alert: SubmissionsRejectedByBackpressure
+        expr: sum by (queue) (rate(jobscheduler_submissions_rejected_total[5m])) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Queue {{ $labels.queue }}: submissions have been rejected (429) for 10 minutes"
+          description: "A max_backlog limit is being hit continuously. Either producers outrun the workers, or the limit is too low."
+          runbook_url: "docs/runbooks/queue-backlog.md"
+      - alert: PostgresUnreachableFromAPI
+        expr: sum(rate(jobscheduler_http_requests_total{code="5xx"}[5m])) > 1 and sum(rate(jobscheduler_http_requests_total{code="2xx"}[5m])) < 0.1
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "API is returning almost only 5xx: Postgres is probably down"
+          runbook_url: "docs/runbooks/database-down.md"

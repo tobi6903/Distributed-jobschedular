@@ -1,0 +1,155 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "js.fullname" . }}-api
+  labels: {{- include "js.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  {{- if not .Values.api.autoscaling.enabled }}
+  replicas: {{ .Values.api.replicas }}
+  {{- end }}
+  selector:
+    matchLabels: {{- include "js.selector" (dict "ctx" . "component" "api") | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels: {{- include "js.selector" (dict "ctx" . "component" "api") | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "js.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      # shutdown delay + shutdown timeout + slack: the API drains itself, so SIGKILL never cuts it short.
+      terminationGracePeriodSeconds: {{ add (int .Values.api.shutdownDelaySeconds) (int .Values.api.shutdownTimeoutSeconds) 5 }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {{- include "js.selector" (dict "ctx" . "component" "api") | nindent 14 }}
+      containers:
+        - name: api
+          image: {{ include "js.image" (dict "ctx" . "app" "api") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext: {{- include "js.containerSecurity" . | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.api.port }}
+          env:
+            {{- include "js.commonEnv" (dict "ctx" . "maxConns" .Values.api.maxConns) | nindent 12 }}
+            - name: HTTP_ADDR
+              value: {{ printf ":%d" (int .Values.api.port) | quote }}
+            - name: SHUTDOWN_DELAY
+              value: {{ printf "%ds" (int .Values.api.shutdownDelaySeconds) | quote }}
+            - name: SHUTDOWN_TIMEOUT
+              value: {{ printf "%ds" (int .Values.api.shutdownTimeoutSeconds) | quote }}
+          # Liveness never touches the database (a DB outage must not restart healthy pods).
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            failureThreshold: 3
+          # Readiness does: a pod that cannot reach Postgres is taken out of rotation.
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+            failureThreshold: 2
+          startupProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 2
+            failureThreshold: 30
+          resources: {{- toYaml .Values.api.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "js.fullname" . }}-api
+  labels: {{- include "js.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  selector: {{- include "js.selector" (dict "ctx" . "component" "api") | nindent 4 }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "js.fullname" . }}-api
+  labels: {{- include "js.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.api.pdb.minAvailable }}
+  selector:
+    matchLabels: {{- include "js.selector" (dict "ctx" . "component" "api") | nindent 6 }}
+{{- if .Values.api.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "js.fullname" . }}-api
+  labels: {{- include "js.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "js.fullname" . }}-api
+  minReplicas: {{ .Values.api.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.api.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.api.autoscaling.targetCPUUtilizationPercentage }}
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+{{- end }}
+{{- if .Values.api.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "js.fullname" . }}-api
+  labels: {{- include "js.labels" . | nindent 4 }}
+  {{- with .Values.api.ingress.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.api.ingress.className }}
+  ingressClassName: {{ .Values.api.ingress.className }}
+  {{- end }}
+  {{- with .Values.api.ingress.tls }}
+  tls: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.api.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "js.fullname" . }}-api
+                port:
+                  name: http
+{{- end }}

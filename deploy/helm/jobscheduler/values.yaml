@@ -1,0 +1,138 @@
+# Defaults are production-leaning. Override per environment (see deploy/argocd/).
+
+image:
+  registry: ghcr.io/vasistamagam/distributed-jobscheduler
+  tag: ""            # defaults to the chart appVersion; CI pins an immutable tag or digest
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+database:
+  # Name of an existing Secret with key DATABASE_URL (recommended: ExternalSecrets, SealedSecrets,
+  # or your cloud secret store). If empty, the chart creates a Secret from `url` (demo only: the
+  # URL then lives in Helm release state).
+  existingSecret: ""
+  url: ""
+  # Connection pool size is per component (see api.maxConns, worker.maxConns, scheduler.maxConns).
+  # Total connections = sum over pods of maxConns (+1 per scheduler for its election session) and
+  # must stay under Postgres max_connections.
+
+logLevel: info
+
+# Optional OTLP/HTTP endpoint for traces, e.g. http://tempo.monitoring:4318. Empty disables tracing.
+otlpEndpoint: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+
+api:
+  replicas: 2
+  # POST /jobs holds a connection for a durable commit, so pool size x commit latency caps a pod's
+  # throughput once the database is busy (measured: p95 1,637 ms with 10 connections vs 146 ms with 40).
+  maxConns: 40
+  port: 8080
+  shutdownDelaySeconds: 5      # stay unready this long before closing listeners (LB drain)
+  shutdownTimeoutSeconds: 20
+  resources:
+    requests: {cpu: 100m, memory: 64Mi}
+    limits: {memory: 256Mi}
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  pdb:
+    minAvailable: 1
+  ingress:
+    enabled: false
+    className: ""
+    host: jobs.example.com
+    annotations: {}
+    tls: []
+
+worker:
+  replicas: 2                  # ignored when keda.enabled (KEDA owns the replica count)
+  maxConns: 20                 # claims are batched, but every finished job needs a connection to record it
+  metricsPort: 9100
+  queues: "default"
+  concurrency: 20
+  batchSize: 0                 # 0 = same as concurrency
+  leaseSeconds: 30             # visibility timeout; heartbeat is lease/3
+  # The longest time any job is allowed to run. Drives the shutdown contract:
+  #   WORKER_SHUTDOWN_GRACE          = maxJobTimeoutSeconds   (drain in-flight jobs fully)
+  #   terminationGracePeriodSeconds  = maxJobTimeoutSeconds + 15 (time to release stragglers and exit)
+  # so Kubernetes never SIGKILLs a worker that is still draining a legitimate job.
+  maxJobTimeoutSeconds: 300
+  retention: 168h              # finished jobs are deleted after this
+  backoffBase: 5s
+  backoffCap: 1h
+  resources:
+    requests: {cpu: 250m, memory: 128Mi}
+    limits: {memory: 512Mi}
+  pdb:
+    maxUnavailable: 25%
+
+scheduler:
+  replicas: 2                  # one leads, the rest are hot standbys
+  maxConns: 5
+  metricsPort: 9101
+  tickSeconds: 1
+  electionRetrySeconds: 5
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {memory: 128Mi}
+  pdb:
+    minAvailable: 1
+
+migrate:
+  enabled: true
+  resources:
+    requests: {cpu: 50m, memory: 32Mi}
+    limits: {memory: 128Mi}
+
+# Autoscale workers on queue depth with KEDA (https://keda.sh), which must be installed.
+keda:
+  enabled: false
+  minReplicaCount: 2
+  maxReplicaCount: 50
+  queue: default
+  # Backlog (runnable pending + retrying jobs) per worker replica. Rule of thumb:
+  # concurrency x seconds of backlog you tolerate / average job seconds.
+  jobsPerReplica: 100
+  pollingIntervalSeconds: 15
+  # Used only when minReplicaCount is 0 (scale to zero). Otherwise KEDA delegates to an HPA and ignores
+  # it; the scale-down pace is the HPA behavior in templates/keda.yaml (5 minute stabilization window).
+  cooldownSeconds: 300
+  # If KEDA cannot reach Postgres, hold this many replicas rather than scaling to the minimum.
+  fallbackReplicas: 4
+
+networkPolicy:
+  enabled: false
+  # Namespaces allowed to reach the API (the ingress controller) and to scrape metrics.
+  ingressNamespaceLabels: {kubernetes.io/metadata.name: ingress-nginx}
+  monitoringNamespaceLabels: {kubernetes.io/metadata.name: monitoring}
+  # Where KEDA runs (only used with the demo in-cluster Postgres: its operator queries the database).
+  kedaNamespaceLabels: {kubernetes.io/metadata.name: keda}
+  # Where Postgres lives. Set exactly one: a CIDR (managed database) or a pod selector (in-cluster).
+  postgres:
+    port: 5432
+    cidr: ""
+    podSelector: {}
+  # Namespace of the OTLP collector, if tracing is on. Empty = no egress rule for it.
+  otlpNamespaceLabels: {}
+
+serviceMonitor:
+  enabled: false               # needs the Prometheus Operator CRDs
+  interval: 15s
+  labels: {}
+
+# DEMO ONLY: a single-node Postgres for kind/minikube. Use a managed database in production.
+postgresql:
+  enabled: false
+  image: postgres:16-alpine
+  storage: 1Gi
+  password: jobs
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []

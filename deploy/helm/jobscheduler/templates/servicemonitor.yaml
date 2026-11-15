@@ -1,0 +1,21 @@
+{{- if .Values.serviceMonitor.enabled }}
+{{- range $component := list "api" "worker" "scheduler" }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "js.fullname" $ }}-{{ $component }}
+  labels:
+    {{- include "js.labels" $ | nindent 4 }}
+    {{- with $.Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels: {{- include "js.selector" (dict "ctx" $ "component" $component) | nindent 6 }}
+  endpoints:
+    - port: {{ if eq $component "api" }}http{{ else }}metrics{{ end }}
+      path: /metrics
+      interval: {{ $.Values.serviceMonitor.interval }}
+{{- end }}
+{{- end }}

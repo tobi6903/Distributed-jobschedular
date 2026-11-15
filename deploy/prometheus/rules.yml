@@ -1,0 +1,59 @@
+# Recording rules: SLIs precomputed over the windows the SLO burn-rate alerts need.
+# See docs/SLO.md for the definitions and the error-budget maths.
+groups:
+  - name: jobscheduler-sli
+    interval: 30s
+    rules:
+      # SLI 1: fraction of jobs claimed within 30s of becoming runnable (bucket le="30").
+      - record: jobscheduler:pickup_within_30s:ratio_rate5m
+        expr: |
+          sum(rate(jobscheduler_job_pickup_latency_seconds_bucket{le="30"}[5m]))
+          /
+          sum(rate(jobscheduler_job_pickup_latency_seconds_count[5m]))
+      - record: jobscheduler:pickup_within_30s:ratio_rate30m
+        expr: |
+          sum(rate(jobscheduler_job_pickup_latency_seconds_bucket{le="30"}[30m]))
+          /
+          sum(rate(jobscheduler_job_pickup_latency_seconds_count[30m]))
+      - record: jobscheduler:pickup_within_30s:ratio_rate1h
+        expr: |
+          sum(rate(jobscheduler_job_pickup_latency_seconds_bucket{le="30"}[1h]))
+          /
+          sum(rate(jobscheduler_job_pickup_latency_seconds_count[1h]))
+      - record: jobscheduler:pickup_within_30s:ratio_rate6h
+        expr: |
+          sum(rate(jobscheduler_job_pickup_latency_seconds_bucket{le="30"}[6h]))
+          /
+          sum(rate(jobscheduler_job_pickup_latency_seconds_count[6h]))
+
+      # SLI 2: fraction of finished attempts that did not dead-letter or permanently fail.
+      - record: jobscheduler:job_success:ratio_rate5m
+        expr: |
+          1 - (
+            sum(rate(jobscheduler_job_duration_seconds_count{outcome=~"dead|failed"}[5m]))
+            /
+            sum(rate(jobscheduler_job_duration_seconds_count{outcome=~"succeeded|dead|failed"}[5m]))
+          )
+      - record: jobscheduler:job_success:ratio_rate1h
+        expr: |
+          1 - (
+            sum(rate(jobscheduler_job_duration_seconds_count{outcome=~"dead|failed"}[1h]))
+            /
+            sum(rate(jobscheduler_job_duration_seconds_count{outcome=~"succeeded|dead|failed"}[1h]))
+          )
+
+      # SLI 3: API availability, the fraction of requests that did not return 5xx.
+      - record: jobscheduler:api_availability:ratio_rate5m
+        expr: |
+          1 - (
+            sum(rate(jobscheduler_http_requests_total{code="5xx"}[5m]))
+            /
+            sum(rate(jobscheduler_http_requests_total[5m]))
+          )
+      - record: jobscheduler:api_availability:ratio_rate1h
+        expr: |
+          1 - (
+            sum(rate(jobscheduler_http_requests_total{code="5xx"}[1h]))
+            /
+            sum(rate(jobscheduler_http_requests_total[1h]))
+          )

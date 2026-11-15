@@ -1,0 +1,53 @@
+{{- if .Values.migrate.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # Demo database: a plain Job, one per release revision (Job specs are immutable, so a fixed name
+  # could not be re-applied on upgrade). Its pods wait for the demo Postgres to come up.
+  #
+  # Why not a hook in that case? A hook cannot run before the database it targets exists, and a
+  # post-install hook deadlocks `helm install --wait`: the KEDA ScaledObject cannot become Ready until
+  # the jobs table exists, but a post-install hook only starts after the wait succeeds.
+  name: {{ include "js.fullname" . }}-migrate{{ if .Values.postgresql.enabled }}-{{ .Release.Revision }}{{ end }}
+  labels: {{- include "js.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  {{- if not .Values.postgresql.enabled }}
+  annotations:
+    # Real database: runs BEFORE the new version is rolled out and blocks the upgrade if it fails.
+    # With Argo CD these hook annotations map to PreSync.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+  {{- end }}
+spec:
+  backoffLimit: 4
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels: {{- include "js.selector" (dict "ctx" . "component" "migrate") | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "js.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: migrate
+          image: {{ include "js.image" (dict "ctx" . "app" "jobctl") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["migrate", "up"]
+          securityContext: {{- include "js.containerSecurity" . | nindent 12 }}
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "js.secretName" . }}
+                  key: DATABASE_URL
+          resources: {{- toYaml .Values.migrate.resources | nindent 12 }}
+{{- end }}

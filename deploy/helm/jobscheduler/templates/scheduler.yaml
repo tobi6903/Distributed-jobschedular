@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "js.fullname" . }}-scheduler
+  labels: {{- include "js.labels" . | nindent 4 }}
+    app.kubernetes.io/component: scheduler
+spec:
+  replicas: {{ .Values.scheduler.replicas }}
+  selector:
+    matchLabels: {{- include "js.selector" (dict "ctx" . "component" "scheduler") | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels: {{- include "js.selector" (dict "ctx" . "component" "scheduler") | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "js.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # Spread replicas across nodes so one node failure cannot take out both the leader and the standby.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {{- include "js.selector" (dict "ctx" . "component" "scheduler") | nindent 14 }}
+      containers:
+        - name: scheduler
+          image: {{ include "js.image" (dict "ctx" . "app" "scheduler") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext: {{- include "js.containerSecurity" . | nindent 12 }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.scheduler.metricsPort }}
+          env:
+            {{- include "js.commonEnv" (dict "ctx" . "maxConns" .Values.scheduler.maxConns) | nindent 12 }}
+            - name: METRICS_ADDR
+              value: {{ printf ":%d" (int .Values.scheduler.metricsPort) | quote }}
+            - name: SCHEDULER_TICK
+              value: {{ printf "%ds" (int .Values.scheduler.tickSeconds) | quote }}
+            - name: SCHEDULER_ELECTION_RETRY
+              value: {{ printf "%ds" (int .Values.scheduler.electionRetrySeconds) | quote }}
+          livenessProbe:
+            httpGet: {path: /healthz, port: metrics}
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: {path: /healthz, port: metrics}
+            periodSeconds: 10
+          resources: {{- toYaml .Values.scheduler.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "js.fullname" . }}-scheduler
+  labels: {{- include "js.labels" . | nindent 4 }}
+    app.kubernetes.io/component: scheduler
+spec:
+  selector: {{- include "js.selector" (dict "ctx" . "component" "scheduler") | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.scheduler.metricsPort }}
+      targetPort: metrics
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "js.fullname" . }}-scheduler
+  labels: {{- include "js.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.scheduler.pdb.minAvailable }}
+  selector:
+    matchLabels: {{- include "js.selector" (dict "ctx" . "component" "scheduler") | nindent 6 }}

@@ -1,0 +1,27 @@
+# Values for the local kind cluster (see deploy/kind/README.md). Images are loaded with `kind load`,
+# so nothing is pulled. Timers are short so scaling and shutdown can be observed in seconds.
+image:
+  registry: jobscheduler
+  tag: dev
+  pullPolicy: Never
+
+postgresql:
+  enabled: true        # demo, single-node database; never use this in production
+
+api:
+  replicas: 2
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 4
+
+worker:
+  concurrency: 10
+  maxJobTimeoutSeconds: 60   # => WORKER_SHUTDOWN_GRACE=60s, terminationGracePeriodSeconds=75
+
+keda:
+  enabled: true
+  minReplicaCount: 2
+  maxReplicaCount: 8
+  jobsPerReplica: 50
+  pollingIntervalSeconds: 5

@@ -1,0 +1,222 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+# Cancel superseded runs of the same branch/PR.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15.0
+      - name: go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        # fsync off and many connections: the 50-worker x 100k-job test is the heaviest consumer.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+      REQUIRE_TEST_DB: "1"   # a missing database fails the build instead of skipping every test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Raise Postgres max_connections for the scale test
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -c "ALTER SYSTEM SET max_connections = 300" -c "ALTER SYSTEM SET fsync = off"
+          docker restart "$(docker ps -q --filter ancestor=postgres:16)"
+          for i in $(seq 30); do pg_isready -h localhost -U postgres && break; sleep 1; done
+      # -race everywhere; includes the 50 workers x 100,000 jobs zero-duplicate / zero-loss test.
+      - run: go test -race -count=1 -timeout 25m -coverprofile=coverage.out ./...
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: helm lint
+        run: |
+          helm lint deploy/helm/jobscheduler --set database.existingSecret=x
+          helm lint deploy/helm/jobscheduler --set database.existingSecret=x --set keda.enabled=true \
+            --set networkPolicy.enabled=true --set networkPolicy.postgres.cidr=10.0.0.0/16 --set serviceMonitor.enabled=true
+      - name: kubeconform (validate rendered manifests against the Kubernetes and CRD schemas)
+        # pipefail: without it a failing `helm template` would feed kubeconform nothing and "pass".
+        shell: bash
+        run: |
+          go install github.com/yannh/kubeconform/cmd/kubeconform@v0.8.0
+          helm template js deploy/helm/jobscheduler -f deploy/argocd/values-prod.yaml \
+            | "$(go env GOPATH)/bin/kubeconform" -strict -summary -ignore-missing-schemas \
+                -schema-location default \
+                -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            | tee /dev/stderr | grep -qE 'Valid: [1-9]'
+      - name: promtool check rules
+        run: |
+          docker run --rm -v "$PWD/deploy/prometheus:/p:ro" --entrypoint promtool prom/prometheus:v2.55.1 check rules /p/alerts.yml /p/rules.yml
+          docker run --rm -v "$PWD/deploy/prometheus:/p:ro" --entrypoint promtool prom/prometheus:v2.55.1 check config /p/prometheus.yml || true
+      - name: promtool test rules (alert and SLO burn-rate unit tests)
+        run: docker run --rm -v "$PWD/deploy/prometheus:/p:ro" --entrypoint promtool prom/prometheus:v2.55.1 test rules /p/tests.yml
+      - name: amtool check-config
+        run: docker run --rm -v "$PWD/deploy/alertmanager:/a:ro" --entrypoint amtool prom/alertmanager:v0.27.0 check-config /a/alertmanager.yml
+      - name: docker compose config
+        run: docker compose -f deploy/docker/docker-compose.yml config -q
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: deploy/docker/Dockerfile
+
+  # The real stack, in containers: bring up Compose, then check it end to end and kill it.
+  smoke:
+    needs: [lint, test, chart]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Start the stack
+        run: docker compose -f deploy/docker/docker-compose.yml up --build -d --wait
+      - name: Smoke test (retry, cron, Prometheus scrape, leader election, distributed trace)
+        run: ./scripts/smoke.sh
+      - name: Chaos (docker kill workers and schedulers mid-run)
+        run: JOBS=2000 KILL_SECONDS=30 ./scripts/chaos-docker.sh
+      - name: Stack logs on failure
+        if: failure()
+        run: docker compose -f deploy/docker/docker-compose.yml logs --tail=150
+      - name: Tear down
+        if: always()
+        run: docker compose -f deploy/docker/docker-compose.yml down -v
+
+  images:
+    needs: [lint, test, chart]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [api, worker, scheduler, jobctl]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}/${{ matrix.app }}
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+      # 1. Build into the local Docker daemon so it can be scanned before anything is pushed.
+      - name: Build (local, for scanning)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          build-args: APP=${{ matrix.app }}
+          load: true
+          push: false
+          tags: scan/${{ matrix.app }}:ci
+          cache-from: type=gha,scope=${{ matrix.app }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.app }}
+      # 2. Trivy: fail the build on fixable HIGH/CRITICAL vulnerabilities (OS packages and Go modules).
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: scan/${{ matrix.app }}:ci
+          format: sarif
+          output: trivy-${{ matrix.app }}.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always() && hashFiles(format('trivy-{0}.sarif', matrix.app)) != ''
+        with:
+          sarif_file: trivy-${{ matrix.app }}.sarif
+          category: trivy-${{ matrix.app }}
+      # 3. Only if the scan passed, and only on main or a tag: push to GHCR (reusing the layer cache).
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          build-args: APP=${{ matrix.app }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.app }}
+          provenance: true
+          sbom: true
+
+  # GitOps: record the new image tag in git; Argo CD notices the commit and rolls it out.
+  # Rollback is `git revert` of this commit.
+  promote:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [images]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set image tag to this commit
+        run: |
+          sed -i "s|^  tag: .*|  tag: \"sha-${GITHUB_SHA}\"|" deploy/argocd/values-prod.yaml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deploy/argocd/values-prod.yaml
+          # [skip ci] stops this commit from triggering another run.
+          git commit -m "deploy: image tag sha-${GITHUB_SHA::12} [skip ci]" || echo "no change"
+          git push

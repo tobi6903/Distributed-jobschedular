@@ -1,0 +1,54 @@
+name: Kubernetes
+
+# Runs the chart on a real (kind) cluster with KEDA and Argo CD and verifies what it promises:
+# autoscaling on queue depth, container crashes, rolling deploys that drain jobs, node drains that
+# respect PodDisruptionBudgets, NetworkPolicies, and GitOps (self-heal, rollout, rollback).
+# Slow (about 25 minutes), so it runs on demand, nightly, and when the deployment files change.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "41 3 * * *"
+  push:
+    branches: [main]
+    paths:
+      - "deploy/helm/**"
+      - "deploy/kind/**"
+      - "deploy/argocd/**"
+      - "scripts/**"
+      - ".github/workflows/k8s.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: k8s-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  kind:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: azure/setup-helm@v4
+      - name: Build the four images
+        run: make docker-build IMAGE_TAG=dev REGISTRY=jobscheduler
+      - name: Create the kind cluster (1 control plane, 2 workers)
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: js
+          config: deploy/kind/kind-config.yaml
+      - name: Install KEDA, metrics-server and the chart
+        run: ./scripts/kind-up.sh
+      - name: Verify autoscaling, crashes, rollouts, node drain, NetworkPolicy
+        run: FULL=1 ./scripts/k8s-verify.sh
+      - name: Verify GitOps with Argo CD
+        run: ./scripts/argocd-verify.sh
+      - name: Cluster state on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide
+          kubectl -n jobs describe pods | tail -120
+          kubectl -n jobs logs --all-containers --prefix --tail=60 -l app.kubernetes.io/name=jobscheduler || true
+          kubectl -n argocd get app -o yaml | tail -80 || true
