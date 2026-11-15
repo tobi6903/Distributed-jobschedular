@@ -105,7 +105,7 @@ jobs:
         run: docker run --rm -v "$PWD/deploy/alertmanager:/a:ro" --entrypoint amtool prom/alertmanager:v0.27.0 check-config /a/alertmanager.yml
       - name: docker compose config
         run: docker compose -f deploy/docker/docker-compose.yml config -q
-      - uses: hadolint/hadolint-action@v3.1.0
+      - uses: hadolint/hadolint-action@v3.5.0
         with:
           dockerfile: deploy/docker/Dockerfile
 
