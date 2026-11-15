@@ -43,8 +43,8 @@ spec: {selector: {app: gitserver}, ports: [{port: 9418, targetPort: 9418}]}
 Y
 kubectl --context "$CTX" -n git wait --for=condition=Ready pod/gitserver --timeout=120s >/dev/null
 URL=git://gitserver.git.svc:9418/repo.git
-sed "s|https://github.com/vasistamagam/distributed-jobscheduler.git|$URL|" "$ROOT/deploy/argocd/project.yaml" | kubectl --context "$CTX" apply -f - >/dev/null
-sed -e "s|https://github.com/vasistamagam/distributed-jobscheduler.git|$URL|" -e 's|../../argocd/values-prod.yaml|../../kind/values-kind.yaml|' \
+sed "s|https://github.com/tobi6903/Distributed-jobschedular.git|$URL|" "$ROOT/deploy/argocd/project.yaml" | kubectl --context "$CTX" apply -f - >/dev/null
+sed -e "s|https://github.com/tobi6903/Distributed-jobschedular.git|$URL|" -e 's|../../argocd/values-prod.yaml|../../kind/values-kind.yaml|' \
   "$ROOT/deploy/argocd/application.yaml" | kubectl --context "$CTX" apply -f - >/dev/null
 
 app() { kubectl --context "$CTX" -n argocd get app jobscheduler -o jsonpath="$1"; }

@@ -1,7 +1,7 @@
 # Defaults are production-leaning. Override per environment (see deploy/argocd/).
 
 image:
-  registry: ghcr.io/vasistamagam/distributed-jobscheduler
+  registry: ghcr.io/tobi6903/distributed-jobschedular
   tag: ""            # defaults to the chart appVersion; CI pins an immutable tag or digest
   pullPolicy: IfNotPresent
 imagePullSecrets: []

@@ -164,21 +164,33 @@ jobs:
           tags: scan/${{ matrix.app }}:ci
           cache-from: type=gha,scope=${{ matrix.app }}
           cache-to: type=gha,mode=max,scope=${{ matrix.app }}
-      # 2. Trivy: fail the build on fixable HIGH/CRITICAL vulnerabilities (OS packages and Go modules).
-      - name: Trivy scan
+      # 2. Trivy, in two steps with different jobs:
+      #    (a) REPORT: every finding, at every severity, goes to the repository's code scanning tab. It never fails.
+      #    (b) GATE: fixable HIGH/CRITICAL findings fail the build, and are PRINTED in the log.
+      #    They must be separate. With format=sarif the action ignores `severity` unless limit-severities-for-sarif
+      #    is set, so a single sarif step with exit-code 1 failed on harmless UNKNOWN-severity Debian advisories, and
+      #    hid what it had found inside the SARIF file.
+      - name: Trivy report (all severities, to code scanning)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: scan/${{ matrix.app }}:ci
           format: sarif
           output: trivy-${{ matrix.app }}.sarif
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          exit-code: "1"
+          exit-code: "0"
       - uses: github/codeql-action/upload-sarif@v3
         if: always() && hashFiles(format('trivy-{0}.sarif', matrix.app)) != ''
+        continue-on-error: true   # code scanning is unavailable on some private repositories; the gate below still runs
         with:
           sarif_file: trivy-${{ matrix.app }}.sarif
           category: trivy-${{ matrix.app }}
+      - name: Trivy gate (fixable HIGH/CRITICAL fails the build)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: scan/${{ matrix.app }}:ci
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
       # 3. Only if the scan passed, and only on main or a tag: push to GHCR (reusing the layer cache).
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
