@@ -22,7 +22,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -55,7 +55,7 @@ jobs:
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
       REQUIRE_TEST_DB: "1"   # a missing database fails the build instead of skipping every test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -75,7 +75,7 @@ jobs:
   chart:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: azure/setup-helm@v4
       - uses: actions/setup-go@v5
         with:
@@ -115,7 +115,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v3
       - name: Start the stack
         run: docker compose -f deploy/docker/docker-compose.yml up --build -d --wait
@@ -142,7 +142,7 @@ jobs:
       matrix:
         app: [api, worker, scheduler, jobctl]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v3
       - id: meta
         uses: docker/metadata-action@v5
@@ -210,7 +210,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set image tag to this commit
         run: |
           sed -i "s|^  tag: .*|  tag: \"sha-${GITHUB_SHA}\"|" deploy/argocd/values-prod.yaml
