@@ -103,8 +103,9 @@ func (o *obsRec) Finished(_, _, outcome string, _ time.Duration) {
 	o.outcomes = append(o.outcomes, outcome)
 	o.mu.Unlock()
 }
-func (o *obsRec) Reaped(int, int) {}
-func (o *obsRec) Deleted(int)     {}
+func (o *obsRec) Reaped(int, int)   {}
+func (o *obsRec) Deleted(int)       {}
+func (o *obsRec) CompleteBatch(int) {}
 func (o *obsRec) has(outcome string) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()

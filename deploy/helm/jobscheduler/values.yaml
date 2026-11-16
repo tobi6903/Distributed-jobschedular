@@ -63,6 +63,7 @@ worker:
   #   terminationGracePeriodSeconds  = maxJobTimeoutSeconds + 15 (time to release stragglers and exit)
   # so Kubernetes never SIGKILLs a worker that is still draining a legitimate job.
   maxJobTimeoutSeconds: 300
+  completeBatch: false         # group commit of "succeeded" writes: fewer commits per job. See docs/OPERATIONS.md "Completion batching"
   retention: 168h              # finished jobs are deleted after this
   backoffBase: 5s
   backoffCap: 1h

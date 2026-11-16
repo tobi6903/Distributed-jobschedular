@@ -2,6 +2,7 @@
 
 | Document | Read it to... |
 |---|---|
+| [FROM_SCRATCH.md](FROM_SCRATCH.md) | **new to all of this?** the whole project explained from zero, one problem at a time, no background assumed |
 | [GUIDE.md](GUIDE.md) | **start here**: understand the system from first principles, tour the code, walk through failures, prepare interview answers, run a demo |
 | [DESIGN.md](DESIGN.md) | see the architecture, state machine, schema, the exact claim query, failure modes, tradeoffs, and what running it for real found |
 | [OPERATIONS.md](OPERATIONS.md) | configure, size and scale it; learn **what breaks first**; day-2 operations; Kubernetes caveats |

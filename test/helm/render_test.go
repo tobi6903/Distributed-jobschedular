@@ -349,6 +349,18 @@ func TestProbes(t *testing.T) {
 	}
 }
 
+// Completion batching is off unless asked for, and the switch reaches the worker as an env var.
+func TestWorkerCompleteBatchToggle(t *testing.T) {
+	docs := mustRender(t, base)
+	if got := envOf(containerOf(find(docs, "Deployment", "-worker")))["WORKER_COMPLETE_BATCH"]; got != "false" {
+		t.Errorf("default WORKER_COMPLETE_BATCH = %q, want false", got)
+	}
+	docs = mustRender(t, obj{"database": obj{"existingSecret": "x"}, "worker": obj{"completeBatch": true}})
+	if got := envOf(containerOf(find(docs, "Deployment", "-worker")))["WORKER_COMPLETE_BATCH"]; got != "true" {
+		t.Errorf("WORKER_COMPLETE_BATCH = %q, want true", got)
+	}
+}
+
 // The shutdown contract: Kubernetes must give a worker longer than it takes to drain.
 func TestWorkerTerminationGraceMatchesJobTimeout(t *testing.T) {
 	for _, timeout := range []int{60, 300, 3600} {

@@ -259,6 +259,52 @@ func (s *Store) Complete(ctx context.Context, ref job.Ref) error {
 		ref.ID, ref.WorkerID, ref.Attempts)
 }
 
+// CompleteBatch marks many jobs succeeded in ONE statement (one durable commit instead of
+// len(refs)). It is the batched form of Complete and carries exactly the same fence, applied
+// per row: a row whose (worker, attempts) no longer matches is simply not updated.
+//
+// The result is aligned with refs: ok[i] is true when refs[i] was completed, false when its
+// lease was lost (the caller must treat that like ErrLeaseLost from Complete). A non-nil error
+// means the statement failed as a whole and NOTHING was committed, so the caller may retry.
+// refs must not contain the same job twice.
+func (s *Store) CompleteBatch(ctx context.Context, refs []job.Ref) ([]bool, error) {
+	ok := make([]bool, len(refs))
+	if len(refs) == 0 {
+		return ok, nil
+	}
+	ids := make([]string, len(refs))
+	workers := make([]string, len(refs))
+	attempts := make([]int32, len(refs))
+	for i, r := range refs {
+		ids[i], workers[i], attempts[i] = r.ID, r.WorkerID, int32(r.Attempts)
+	}
+	rows, err := s.pool.Query(ctx, `
+		UPDATE jobs j SET status = 'succeeded', locked_by = NULL, locked_until = NULL,
+		       finished_at = now(), updated_at = now()
+		FROM unnest($1::uuid[], $2::text[], $3::int[]) AS r(id, worker, attempts)
+		WHERE j.id = r.id AND j.status = 'running' AND j.locked_by = r.worker AND j.attempts = r.attempts
+		RETURNING j.id::text`, ids, workers, attempts)
+	if err != nil {
+		return nil, fmt.Errorf("complete batch: %w", err)
+	}
+	defer rows.Close()
+	done := make(map[string]struct{}, len(refs))
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("complete batch: %w", err)
+		}
+		done[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("complete batch: %w", err)
+	}
+	for i, r := range refs {
+		_, ok[i] = done[r.ID]
+	}
+	return ok, nil
+}
+
 // FailParams describes the outcome of a failed attempt, decided by the worker.
 type FailParams struct {
 	Status job.Status    // retrying, dead or failed

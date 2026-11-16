@@ -7,6 +7,7 @@ Claims jobs from the store and runs them through a **handler registry**, handlin
 | File | Contents |
 |---|---|
 | [worker.go](worker.go) | `Worker`, `Config`, `New`, `Run`; the poll loop, `execute`, `heartbeat`, `finalize`, the maintenance loop (reaper and retention sweeper) |
+| [completer.go](completer.go) | `completer`, `BatchCompleter`: optional group commit of "succeeded" writes (`Config.CompleteBatch`) |
 | [registry.go](registry.go) | `Handler`, `Registry`, `Permanent(err)` / `IsPermanent`, `ErrUnknownType` |
 
 ## Writing a handler
@@ -27,7 +28,7 @@ err := w.Run(ctx)   // returns after a graceful drain once ctx is cancelled
 
 1. **Poll loop.** A semaphore channel limits concurrency. The loop waits for a free slot, claims exactly as many jobs as there are free slots (up to `BatchSize`), and sleeps a jittered `PollInterval` only when the queue is empty.
 2. **`execute`** per job: join the trace stored in the job row, start a **heartbeat** goroutine (every `Lease/3`), run the handler under `timeout` (the job's own or `DefaultTimeout`) with panic recovery.
-3. **`finalize`** decides the outcome: success -> `Complete`; `Permanent` error or unknown type -> `failed`; attempts exhausted -> `dead`; otherwise `retrying` with `Backoff.Delay`. A lost lease means the result is discarded.
+3. **`finalize`** decides the outcome: success -> `Complete` (or, with `CompleteBatch`, a batched write: the job blocks until its group is committed, so its slot and lease are held as before); `Permanent` error or unknown type -> `failed`; attempts exhausted -> `dead`; otherwise `retrying` with `Backoff.Delay`. A lost lease means the result is discarded.
 4. **Maintenance** (every worker, safe thanks to `SKIP LOCKED`): `Reap` expired leases and, if `Retention` is set, `DeleteFinished` old rows.
 
 ## Shutdown (SIGTERM)

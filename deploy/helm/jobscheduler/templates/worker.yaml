@@ -65,6 +65,8 @@ spec:
               value: {{ printf "%ds" (int .Values.worker.maxJobTimeoutSeconds) | quote }}
             - name: WORKER_SHUTDOWN_GRACE
               value: {{ printf "%ds" (int .Values.worker.maxJobTimeoutSeconds) | quote }}
+            - name: WORKER_COMPLETE_BATCH
+              value: {{ .Values.worker.completeBatch | quote }}
             - name: RETENTION
               value: {{ .Values.worker.retention | quote }}
             - name: BACKOFF_BASE

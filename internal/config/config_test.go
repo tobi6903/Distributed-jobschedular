@@ -34,6 +34,22 @@ func TestLoadWorkerOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadWorkerCompleteBatching(t *testing.T) {
+	c, err := LoadWorker(env(map[string]string{"DATABASE_URL": "x"}))
+	if err != nil || c.CompleteBatch || c.CompleteBatchLinger != 0 || c.CompleteBatchMax != 0 {
+		t.Fatalf("must be off by default: %+v %v", c, err)
+	}
+	c, err = LoadWorker(env(map[string]string{"DATABASE_URL": "x", "WORKER_COMPLETE_BATCH": "true",
+		"WORKER_COMPLETE_BATCH_LINGER": "5ms", "WORKER_COMPLETE_BATCH_MAX": "64"}))
+	if err != nil || !c.CompleteBatch || c.CompleteBatchLinger != 5*time.Millisecond || c.CompleteBatchMax != 64 {
+		t.Fatalf("%+v %v", c, err)
+	}
+	if _, err = LoadWorker(env(map[string]string{"DATABASE_URL": "x", "WORKER_COMPLETE_BATCH": "maybe"})); err == nil ||
+		!strings.Contains(err.Error(), "WORKER_COMPLETE_BATCH") {
+		t.Fatalf("a bad boolean must be reported: %v", err)
+	}
+}
+
 func TestLoadErrors(t *testing.T) {
 	tests := []struct {
 		name string

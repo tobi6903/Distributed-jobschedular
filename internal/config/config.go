@@ -40,6 +40,10 @@ type Worker struct {
 	Retention         time.Duration
 	BackoffBase       time.Duration
 	BackoffCap        time.Duration
+
+	CompleteBatch       bool          // group commit of success writes
+	CompleteBatchLinger time.Duration // optional extra wait to fill a batch (0 = none)
+	CompleteBatchMax    int           // 0 = Concurrency
 }
 
 type Scheduler struct {
@@ -97,6 +101,19 @@ func (l *loader) integer(name string, def int) int {
 	return n
 }
 
+func (l *loader) boolean(name string, def bool) bool {
+	v := l.get(name)
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		l.errs = append(l.errs, fmt.Errorf("%s: invalid boolean %q", name, v))
+		return def
+	}
+	return b
+}
+
 func (l *loader) csv(name string, def []string) []string {
 	v := l.get(name)
 	if v == "" {
@@ -150,19 +167,22 @@ func LoadAPI(getenv func(string) string) (API, error) {
 func LoadWorker(getenv func(string) string) (Worker, error) {
 	l := &loader{get: getenv}
 	c := Worker{
-		Common:            l.common(":9100"),
-		Queues:            l.csv("WORKER_QUEUES", []string{"default"}),
-		Concurrency:       l.integer("WORKER_CONCURRENCY", 10),
-		BatchSize:         l.integer("WORKER_BATCH_SIZE", 0),
-		PollInterval:      l.dur("WORKER_POLL_INTERVAL", time.Second),
-		Lease:             l.dur("WORKER_LEASE", 30*time.Second),
-		HeartbeatInterval: l.dur("WORKER_HEARTBEAT_INTERVAL", 0),
-		DefaultTimeout:    l.dur("WORKER_DEFAULT_TIMEOUT", 5*time.Minute),
-		ShutdownGrace:     l.dur("WORKER_SHUTDOWN_GRACE", 30*time.Second),
-		ReapInterval:      l.dur("WORKER_REAP_INTERVAL", 10*time.Second),
-		Retention:         l.dur("RETENTION", 7*24*time.Hour),
-		BackoffBase:       l.dur("BACKOFF_BASE", 5*time.Second),
-		BackoffCap:        l.dur("BACKOFF_CAP", time.Hour),
+		Common:              l.common(":9100"),
+		Queues:              l.csv("WORKER_QUEUES", []string{"default"}),
+		Concurrency:         l.integer("WORKER_CONCURRENCY", 10),
+		BatchSize:           l.integer("WORKER_BATCH_SIZE", 0),
+		PollInterval:        l.dur("WORKER_POLL_INTERVAL", time.Second),
+		Lease:               l.dur("WORKER_LEASE", 30*time.Second),
+		HeartbeatInterval:   l.dur("WORKER_HEARTBEAT_INTERVAL", 0),
+		DefaultTimeout:      l.dur("WORKER_DEFAULT_TIMEOUT", 5*time.Minute),
+		ShutdownGrace:       l.dur("WORKER_SHUTDOWN_GRACE", 30*time.Second),
+		ReapInterval:        l.dur("WORKER_REAP_INTERVAL", 10*time.Second),
+		CompleteBatch:       l.boolean("WORKER_COMPLETE_BATCH", false),
+		CompleteBatchLinger: l.dur("WORKER_COMPLETE_BATCH_LINGER", 0),
+		CompleteBatchMax:    l.integer("WORKER_COMPLETE_BATCH_MAX", 0),
+		Retention:           l.dur("RETENTION", 7*24*time.Hour),
+		BackoffBase:         l.dur("BACKOFF_BASE", 5*time.Second),
+		BackoffCap:          l.dur("BACKOFF_CAP", time.Hour),
 	}
 	if c.Concurrency < 1 {
 		l.errs = append(l.errs, errors.New("WORKER_CONCURRENCY must be >= 1"))

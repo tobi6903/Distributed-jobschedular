@@ -6,7 +6,7 @@ The **Postgres-backed job store**: every durable state transition in the system 
 
 | File | Contents |
 |---|---|
-| [store.go](store.go) | `Store`: `Enqueue`, `Get`, `Claim`, `Heartbeat`, `Complete`, `Fail`, `Release`, `Reap`, `Replay`, `DeleteFinished`, `Depth`, `OldestReady` |
+| [store.go](store.go) | `Store`: `Enqueue`, `Get`, `Claim`, `Heartbeat`, `Complete`, `CompleteBatch`, `Fail`, `Release`, `Reap`, `Replay`, `DeleteFinished`, `Depth`, `OldestReady` |
 | [limits.go](limits.go) | Per-tenant limits: `SetLimit`, `DeleteLimit`, `ListLimits`, `Admit` (backpressure), the governed claim path, rule and backlog caches |
 | [apikeys.go](apikeys.go) | `CreateAPIKey`, `TenantForKey` (keys are 256-bit random values stored as SHA-256 hashes) |
 | [pool.go](pool.go) | `Connect`: opens a `pgxpool` and waits for the database to accept connections |
@@ -31,6 +31,7 @@ FROM picked WHERE jobs.id = picked.id RETURNING ...
 
 ## Invariants
 
+- **Batched completion.** `CompleteBatch` completes many jobs in one statement (`UPDATE ... FROM unnest(...)`), applying the same fence per row and returning which refs were completed; see [DESIGN.md section 19](../../docs/DESIGN.md#19-completion-batching-group-commit).
 - **Fencing.** `Heartbeat`, `Complete`, `Fail` and `Release` all use `WHERE id AND status='running' AND locked_by AND attempts`. Zero rows affected becomes `ErrLeaseLost`: a worker that lost its lease can never overwrite the current owner's result.
 - **`attempts` is counted at claim time**, so a job that crashes its worker still burns an attempt. `Release` refunds it (an interrupted deploy is not the job's fault).
 - **All time comes from the database** (`now()`), including delays and lease deadlines.

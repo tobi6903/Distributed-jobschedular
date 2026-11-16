@@ -56,17 +56,20 @@ func run() error {
 
 	m := metrics.New()
 	w := worker.New(queue.New(pool), reg, worker.Config{
-		Queues:            cfg.Queues,
-		Concurrency:       cfg.Concurrency,
-		BatchSize:         cfg.BatchSize,
-		PollInterval:      cfg.PollInterval,
-		Lease:             cfg.Lease,
-		HeartbeatInterval: cfg.HeartbeatInterval,
-		DefaultTimeout:    cfg.DefaultTimeout,
-		ShutdownGrace:     cfg.ShutdownGrace,
-		ReapInterval:      cfg.ReapInterval,
-		Retention:         cfg.Retention,
-		Backoff:           job.Backoff{Base: cfg.BackoffBase, Cap: cfg.BackoffCap},
+		Queues:              cfg.Queues,
+		Concurrency:         cfg.Concurrency,
+		BatchSize:           cfg.BatchSize,
+		PollInterval:        cfg.PollInterval,
+		Lease:               cfg.Lease,
+		HeartbeatInterval:   cfg.HeartbeatInterval,
+		DefaultTimeout:      cfg.DefaultTimeout,
+		ShutdownGrace:       cfg.ShutdownGrace,
+		ReapInterval:        cfg.ReapInterval,
+		CompleteBatch:       cfg.CompleteBatch,
+		CompleteBatchLinger: cfg.CompleteBatchLinger,
+		CompleteBatchMax:    cfg.CompleteBatchMax,
+		Retention:           cfg.Retention,
+		Backoff:             job.Backoff{Base: cfg.BackoffBase, Cap: cfg.BackoffCap},
 	}, worker.WithLogger(log), worker.WithObserver(m.WorkerObserver()))
 
 	// Ops endpoint: /metrics for Prometheus, /healthz for the liveness probe.
@@ -81,7 +84,7 @@ func run() error {
 	}()
 
 	log.Info("worker starting", "id", w.ID(), "queues", cfg.Queues, "concurrency", cfg.Concurrency,
-		"lease", cfg.Lease.String(), "types", reg.Types())
+		"lease", cfg.Lease.String(), "complete_batch", cfg.CompleteBatch, "complete_batch_linger", cfg.CompleteBatchLinger.String(), "types", reg.Types())
 	runErr := w.Run(ctx)
 
 	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
