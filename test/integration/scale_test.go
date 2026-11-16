@@ -42,7 +42,15 @@ func countStatus(t testing.TB, e *env) (succeeded, other int) {
 // "Duplicate" = a handler invoked twice for the same job. With no failures injected and a
 // lease far longer than the test, SKIP LOCKED + leases must make that impossible.
 // "Lost" = a job that never reaches succeeded, or whose handler never ran.
-func TestFiftyWorkersHundredThousandJobs(t *testing.T) {
+func TestFiftyWorkersHundredThousandJobs(t *testing.T) { runFiftyWorkers(t, false) }
+
+// The same invariants with completion batching on: the fence and the exactly-one-run-per-job
+// property must survive results being committed in groups.
+func TestFiftyWorkersHundredThousandJobsBatchedCompletion(t *testing.T) {
+	runFiftyWorkers(t, true)
+}
+
+func runFiftyWorkers(t *testing.T, batch bool) {
 	total := 100_000
 	if testing.Short() {
 		total = 5_000
@@ -67,6 +75,7 @@ func TestFiftyWorkersHundredThousandJobs(t *testing.T) {
 		cfg.Lease = 5 * time.Minute // far beyond the test: no reclaim may happen
 		cfg.HeartbeatInterval = time.Minute
 		cfg.ReapInterval = time.Second
+		cfg.CompleteBatch = batch
 		fleet = append(fleet, startWorker(t, e.store, reg, cfg))
 	}
 

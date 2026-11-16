@@ -8,7 +8,7 @@ Portfolio project for SDE-2 interviews: a Distributed Job Scheduler in Go (mini 
 
 ## Current phase
 
-**Phases 0 to 7: complete. Phase 8 item done: rate-limited queues with backpressure** (per-tenant concurrency caps, token-bucket dispatch rate, 429 backpressure; see DESIGN.md section 18). Remaining Phase 8 options, none started: DAG workflows, outbox pattern, K8s Operator. Also unstarted: completion-write batching (the first throughput limit).
+**Phases 0 to 7: complete. Phase 8 item done: rate-limited queues with backpressure** (per-tenant concurrency caps, token-bucket dispatch rate, 429 backpressure; see DESIGN.md section 18). Remaining Phase 8 options, none started: DAG workflows, outbox pattern, K8s Operator. Also done: completion-write batching (group commit, opt-in via `WORKER_COMPLETE_BATCH`; DESIGN.md section 19; +51% at 8 workers, no measurable gain at 1 to 4).
 
 Environment notes:
 - Go lives in `~/sdk/go/bin` and CLI tools in `~/sdk/tools` (add both to PATH): helm v4.3.1, kubeconform v0.8.0, hadolint v2.15.1, actionlint v1.7.12, k6 v2.3.0, promtool 3.15.1, amtool 0.34.2, golangci-lint v2.15.0, each downloaded at a pinned version and sha256-verified. The docker buildx plugin is installed per-user in `~/.docker/cli-plugins`.
@@ -16,7 +16,7 @@ Environment notes:
 - Tests: `make test` sets `REQUIRE_TEST_DB=1` and starts Postgres via testcontainers (or uses `TEST_DATABASE_URL`). Run Go tooling with `GOTOOLCHAIN=go1.26.9` to match `go.mod` and CI.
 - `make validate` (no container runtime needed), `make up` then `make smoke` / `make chaos-docker` / `make load-test` (Docker).
 - kind v0.33.0 and kubectl v1.37.2 are in `~/sdk/tools`. Kubernetes: `make docker-build IMAGE_TAG=dev REGISTRY=jobscheduler && make kind-up`, then `make k8s-verify` (FULL=1 for the long test) and `make argocd-verify`; cluster context is `kind-js`. See deploy/kind/README.md.
-- GitHub Actions has run for real (repo `tobi6903/Distributed-jobschedular`, `gh` is authenticated): `test`, `lint`, `chart`, `smoke` and the Kubernetes workflow passed. The `images` job failed on a misconfigured Trivy gate (fixed, not yet re-run). Still never run: anything on a managed cloud cluster, and the GHCR push / `promote` commit.
+- GitHub Actions has run for real (repo `tobi6903/Distributed-jobschedular`, `gh` is authenticated): `test`, `lint`, `chart`, `smoke` and the Kubernetes workflow passed. The `images` job first failed on a misconfigured Trivy gate; after the fix the whole pipeline passed on `main` (GHCR push of four public images, `promote` bot commit). Still never run: anything on a managed cloud cluster, and rolling the published GHCR images out through Argo CD.
 - When reading CI: `gh run list -R tobi6903/Distributed-jobschedular`, `gh run view <id> --json jobs`, and `gh api repos/<repo>/actions/jobs/<job_id>/logs` for a finished job inside a running workflow. Trivy SARIF findings are in code scanning (`gh api repos/<repo>/code-scanning/alerts`), not in the log. Scan images locally with a FRESH `--cache-dir`: a stale vulnerability DB gives false negatives.
 - The Go module path is still the placeholder `github.com/vasistamagam/distributed-jobscheduler` (27 files import it); deployment-facing names (registry, Argo repoURL) use the real repo. Renaming the module is optional.
 - Metrics: create fixed-label counters at zero in `metrics.New()` (a counter born at its first increment is invisible to `rate()`/`increase()`); quantiles above the top finite histogram bucket are interpolated, so do not chart or alert on them.

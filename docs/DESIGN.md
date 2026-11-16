@@ -354,7 +354,7 @@ Interfaces are small and defined by the consumer, for example `worker` depends o
 
 - **Killed-session failover overlaps briefly.** When a leader's database session is terminated, Postgres releases the advisory lock immediately, a standby acquires it, and the old leader only notices on its next check (at most one check interval, 1s). For up to that window two replicas believe they lead. This is exactly why double-fire safety does **not** rest on the election: row locks plus the per-slot idempotency key hold regardless. `TestNeverDoubleFiresWithoutLeaderElection` runs six schedulers with election disabled and still gets exactly one job per slot, and the election test asserts overlap resolves to a single leader rather than pretending it never happens. A graceful leader stop never overlaps.
 - **In-process chaos found no violations, and counts what it should.** With 12 of 20 workers killed at random, the test asserts a job can only have executed more times than once if it was claimed more than once (`attempts`), which is the at-least-once contract stated precisely.
-- **Benchmarks showed commit rate, not CPU, is the limit** (see OPERATIONS.md, "What breaks first"), which is why completion batching is the first optimisation listed.
+- **Benchmarks showed commit rate, not CPU, is the limit** (see OPERATIONS.md, "What breaks first"), which is why completion batching was the first optimisation built (section 19).
 
 **Verification, and what running it for real found**
 
@@ -402,4 +402,29 @@ That run found real defects, none visible before. They are worth listing because
 
 Verified on the cluster: KEDA scaling up (2 -> 4 -> 8) and down (8 -> 6 -> 4 -> 2); crash recovery (0 lost, cron exact); rolling deploys that drain in-flight jobs; forced release of jobs longer than the grace (attempt refunded); node drains that respect PodDisruptionBudgets; NetworkPolicy blocking and allowing; Argo CD deploying the chart, healing drift, rolling out a commit and rolling back on `git revert`.
 
-Still unverified: the `images` workflow job after the Trivy fix (push to GHCR and the GitOps `promote` commit); a managed cloud cluster, real ingress controller, external database and secret manager; the API HPA scaling out under load.
+After the fix the `images` jobs passed, pushed four public images to GHCR, and `promote` committed the new tag to `values-prod.yaml`; the published images were pulled, run and re-scanned. Still unverified: rolling the *published* images out through Argo CD; a managed cloud cluster, real ingress controller, external database and secret manager; the API HPA scaling out under load.
+
+## 19. Completion batching (group commit)
+
+**Problem.** Benchmarks showed every job costs one durable commit when it completes, and one Postgres commits for the whole fleet. Past a few workers, extra containers added contention rather than throughput (peak at 4 workers, then a fall).
+
+**Design.** `Store.CompleteBatch(refs)` completes many jobs in one statement:
+
+```sql
+UPDATE jobs j SET status = 'succeeded', locked_by = NULL, locked_until = NULL, finished_at = now(), updated_at = now()
+FROM unnest($1::uuid[], $2::text[], $3::int[]) AS r(id, worker, attempts)
+WHERE j.id = r.id AND j.status = 'running' AND j.locked_by = r.worker AND j.attempts = r.attempts
+RETURNING j.id
+```
+
+The fence is the same as `Complete`, applied **per row**. A row that does not match is simply not updated; the store returns which refs were completed, and the worker turns each missing one into `ErrLeaseLost` for that job alone. The statement is atomic, so a statement-level error means nothing committed and every waiter retries through the existing `write()` loop.
+
+In the worker, each finishing job sends its ref to a `completer` and **blocks until its batch is committed**. One flusher goroutine writes whatever has accumulated, then immediately whatever piled up while that write was in flight. This is group commit: no timer, so no added latency when idle, and a batch size that adapts to the commit latency under load. Because the job goroutine blocks, its execution slot and lease are held until the result is durable, so concurrency limits, graceful shutdown and the reaper behave exactly as before. After `Run` has drained, the completer is stopped (flushing what is waiting); a handler that finishes after that falls back to a direct write rather than blocking forever.
+
+**What I tried first, and why it changed.** The first version held results for a fixed 5 ms window. It cut commits per job from about 1.0 to 0.25 but was *slower* at 1 and 2 workers, because every job kept its slot for the extra wait. Group commit has the same commit reduction without that cost, so the timer survives only as an optional `linger`, documented as not worth setting. A variant with three concurrent flushers was no better than one, so it was removed.
+
+**Measured.** At 8 workers: 3,997 to 6,054 jobs/s (+51%), commits per job 0.84 to 0.24. At 1 to 4 workers there is no difference beyond run-to-run noise. Throughput rose less than commits fell, so commit rate was a limit but not the only one (see OPERATIONS.md, "Completion batching").
+
+**Tradeoffs.** A success is recorded up to one write later, so a crash in that window re-runs the job: within at-least-once, and bounded by one statement. It is opt-in (`WORKER_COMPLETE_BATCH`) because it is neutral at small scale. Only successes are batched: failures and releases are rare and carry per-job parameters.
+
+**Proof.** `CompleteBatch` is tested per row (mixed batch with wrong-owner and wrong-attempt rows; replaying a batch completes nothing; a zombie cannot complete through the batch path). **Mutation check:** removing `AND j.attempts = r.attempts` made `TestCompleteBatchIsFencedPerRow` fail. The 50-worker, 100,000-job test passes with batching on (0 duplicates, 0 lost), as does container chaos (8 SIGKILLs, 12,000 of 12,000 succeeded, 101 recovered, 0 cron duplicates or gaps) and a graceful stop mid-job.

@@ -164,7 +164,24 @@ The same burst, as it appears in the Grafana dashboard that ships with the repo:
 
 ![Backlog drain throughput by worker containers: 975, 1,834, 3,319 and 2,711 jobs per second for 1, 2, 4 and 8 workers](docs/images/perf-drain-throughput.png)
 
-A backlog of no-op jobs is preloaded and drained. Throughput scales to 4 workers and then **falls**: every job costs one durable commit, and one Postgres commits for all of them, so past the peak extra containers only add contention. This is the first limit you hit, and the first optimisation would be batching completion writes ([docs/OPERATIONS.md](docs/OPERATIONS.md#what-breaks-first)). Real jobs spend their time in handlers rather than the queue, so real-world scaling is far better than no-op numbers suggest.
+A backlog of no-op jobs is preloaded and drained. Throughput scales to 4 workers and then **falls**: every job costs one durable commit, and one Postgres commits for all of them, so past the peak extra containers only add contention. This is the first limit you hit, and the next section is my attempt to relieve it ([docs/OPERATIONS.md](docs/OPERATIONS.md#what-breaks-first)). (The fall itself did not reproduce in the later batching sweep, where the baseline kept rising from 3,234 to 3,997 jobs/s between 4 and 8 workers; flattening and run-to-run variation are the robust findings, not the exact dip.) Real jobs spend their time in handlers rather than the queue, so real-world scaling is far better than no-op numbers suggest.
+
+### Completion batching: fewer commits, more throughput once commits are the limit
+
+![Drain throughput by worker count with completion batching off, with group commit, and with group commit plus a 5 ms linger, and Postgres commits per job](docs/images/perf-completion-batching.png)
+
+The chart above is the problem and this is the fix: workers write their "succeeded" results in groups (**group commit**: one flusher writes whatever piled up while the previous write was in flight, no timer) with the fence still applied per row. Same backlog, 5 runs per cell. The "one commit per job" column is re-measured in this sweep, so it differs from the chart above (for example 3,997 versus 2,711 at 8 workers): compare within a sweep, never across them.
+
+
+
+| Workers | One commit per job | Group commit | Commits per job (off to on) |
+|---|---|---|---|
+| 1 | 1,156 jobs/s | 1,159 | 1.01 to 0.28 |
+| 2 | 2,015 | 1,869 | 0.96 to 0.30 |
+| 4 | 3,234 | 3,292 | 0.91 to 0.29 |
+| 8 | 3,997 | **6,054 (+51%)** | 0.84 to 0.24 |
+
+Read it honestly: the mechanism is unambiguous (commits per job fall 3.1 to 3.6x at every worker count), but the throughput gain only shows at **8 workers**; at 1 to 4 it is within run-to-run noise (the 2-worker runs ranged from 1,763 to 3,227 with batching off). Throughput rose 1.5x while commits fell 3.5x, so commit rate was *a* limit, not the only one: row updates, WAL volume and a host shared by every container remain. My first version held results for a fixed 5 ms window and was **slower** at 1 and 2 workers (958 and 1,595 versus 1,156 and 2,015 jobs/s), because every job keeps its slot for the wait; that is the third bar, and why the shipped design has no timer. It is **opt-in** (`WORKER_COMPLETE_BATCH=true`, Helm `worker.completeBatch`) because it is neutral at small scale. Safety is covered in [DESIGN.md section 19](docs/DESIGN.md#19-completion-batching-group-commit): a mutation test shows the fence test fails if the fence is removed, the 50-worker 100,000-job test still has 0 duplicates and 0 lost with it on, container chaos with it on lost nothing (8 SIGKILLs, 12,000 of 12,000 jobs, 101 recovered), and `docker stop` mid-job still exits 0 with every job done on attempt 1.
 
 ### Submit latency as load rises
 
@@ -250,7 +267,8 @@ docs/                                   DESIGN.md, OPERATIONS.md, SLO.md, runboo
 
 ## Documentation
 
-- [docs/GUIDE.md](docs/GUIDE.md): **start here**: the system explained from first principles, a code tour, failure walkthroughs, interview Q&A and a demo script
+- [docs/FROM_SCRATCH.md](docs/FROM_SCRATCH.md): **new to this?** the whole project explained from zero, no background assumed
+- [docs/GUIDE.md](docs/GUIDE.md): the next level down: the system explained from first principles, a code tour, failure walkthroughs, interview Q&A and a demo script
 - [docs/DESIGN.md](docs/DESIGN.md): architecture, state machine, schema, the exact claim query, failure modes, tradeoffs
 - [docs/OPERATIONS.md](docs/OPERATIONS.md): configuration, sizing, scaling limits, **what breaks first**, day-2 operations
 - [docs/SLO.md](docs/SLO.md) and [docs/runbooks/](docs/runbooks/)
@@ -262,7 +280,7 @@ Everything below was executed, on Linux with Docker 29, a 3-node kind cluster (K
 
 | Verified by running it | Not verified |
 |---|---|
-| **The full test suite (220 tests, 0 skipped) through testcontainers with `-race`**, including 50 workers x 100k jobs | The `images` job end to end: the Trivy gate failed on the first CI run (a misconfigured gate, not a vulnerability, see below), is fixed, and has not run again yet; so the push to GHCR and the GitOps tag commit (`promote`) are unproven |
+| **The full test suite (237 tests, 0 skipped) through testcontainers with `-race`**, including 50 workers x 100k jobs | Rolling the **published** GHCR images out through Argo CD (`make argocd-verify` deploys locally built images from an in-cluster git repo) |
 | **The four images**: BuildKit build, non-root, no shell, 22 to 35 MB, **Trivy: 0 fixable HIGH/CRITICAL** | A managed cloud Kubernetes, a real ingress controller, an external database and real secret management (the kind cluster uses an in-cluster demo Postgres) |
 | **The full Compose stack**: `make smoke` passes (retry, cron, Prometheus scrapes all replicas, one scheduler leads, one trace spans the API and worker containers in Tempo); all 25 rules healthy; all 28 dashboard panels' queries run; JSON logs reach Loki | Grafana against a real Kubernetes cluster (dashboards and screenshots come from the Compose stack) |
 | **Graceful `docker stop`** mid-job (exit 0, jobs finish on attempt 1); **container chaos** (`make chaos-docker`, 11 to 14 SIGKILLs: 0 jobs lost, 0 cron duplicates, 0 gaps) | The API HPA actually scaling out (its CPU metric is read correctly, but no load pushed it over target) |
@@ -271,7 +289,7 @@ Everything below was executed, on Linux with Docker 29, a 3-node kind cluster (K
 | k6 against the containerized stack at 300 jobs/s: submit p95 20 ms, p99 111 ms, 0 failures | |
 | `golangci-lint` v2, `helm lint`, `kubeconform`, `promtool check` and **12 `promtool test rules` test cases**, `amtool`, `hadolint`, `actionlint` (`make validate`) | |
 
-**On GitHub Actions (first real run of the workflows):** `test` (220 tests, `-race`), `lint` (`golangci-lint` v2), `chart` (`helm lint`, `kubeconform`, `promtool`, `amtool`, `hadolint`, compose validation) and `smoke` (the Compose stack with its chaos run) **passed**, and the **Kubernetes workflow passed end to end** (kind, KEDA, the full `k8s-verify` suite including crash chaos, rolling-deploy drain, node drain and NetworkPolicy, then the Argo CD GitOps check). The four `images` jobs failed at the Trivy step. Cause: the action ignores the severity filter for SARIF output unless `limit-severities-for-sarif` is set, so harmless `UNKNOWN`-severity Debian advisories (`tzdata`, `ca-certificates` in the base image) failed a gate meant for fixable HIGH/CRITICAL findings, and the findings were hidden inside the SARIF file. The step is now a non-failing full report to code scanning plus a gate that prints its findings.
+**On GitHub Actions (first real run of the workflows):** `test` (237 tests, `-race`), `lint` (`golangci-lint` v2), `chart` (`helm lint`, `kubeconform`, `promtool`, `amtool`, `hadolint`, compose validation) and `smoke` (the Compose stack with its chaos run) **passed**, and the **Kubernetes workflow passed end to end** (kind, KEDA, the full `k8s-verify` suite including crash chaos, rolling-deploy drain, node drain and NetworkPolicy, then the Argo CD GitOps check). The four `images` jobs failed at the Trivy step. Cause: the action ignores the severity filter for SARIF output unless `limit-severities-for-sarif` is set, so harmless `UNKNOWN`-severity Debian advisories (`tzdata`, `ca-certificates` in the base image) failed a gate meant for fixable HIGH/CRITICAL findings, and the findings were hidden inside the SARIF file. The step is now a non-failing full report to code scanning plus a gate that prints its findings. **After the fix the whole pipeline passed on `main`**: all four `images` jobs (Trivy gate, then push), and `promote`, which committed `deploy: image tag sha-0c5a8cf9e601 [skip ci]` to `values-prod.yaml`. The four images are public in GHCR (`ghcr.io/tobi6903/distributed-jobschedular/{api,worker,scheduler,jobctl}`); I pulled the published images and ran them (non-root, readable startup error, labels carrying the repo and commit) and re-scanned the published worker image with a fresh database (gate passes).
 
 `make validate` runs the checks that need no container runtime; `make smoke` / `make chaos-docker` run against `make up`; `make kind-up`, `make k8s-verify` and `make argocd-verify` run against kind ([deploy/kind/README.md](deploy/kind/README.md)).
 

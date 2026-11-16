@@ -5,6 +5,7 @@ Raw performance measurements and how the charts in the main [README](../../READM
 ```bash
 make up                                   # the Compose stack (add the renderer for screenshots, see below)
 ./scripts/perf-collect.sh                 # about 15 minutes; needs k6
+./scripts/perf-batching.sh                # about 15 minutes: completion batching off vs on
 ~/sdk/venv/bin/python scripts/perf-charts.py        # or any Python with matplotlib
 ./scripts/grafana-screenshots.sh $(cut -d' ' -f1 docs/perf/data/window.txt) $(cut -d' ' -f2 docs/perf/data/window.txt)
 ```
@@ -18,12 +19,13 @@ make up                                   # the Compose stack (add the renderer 
 | `pool.csv` | `scenario, pool, p50_ms, p95_ms, p99_ms, achieved_rps, ...` | the API at 400 req/s with its connection pool at 10 and 40, on an idle database and while 8 workers drain a 60,000-job backlog |
 | `burst.json`, `burst.window` | Prometheus `query_range` results (queue depth, completed jobs/s, p50 and p99 pickup latency, oldest runnable job age) and the start/end epoch | **a burst**: 60,000 no-op jobs inserted at once and drained by 4 workers, after a 60 s quiet period so rate windows contain only this run |
 | `chaos.csv`, `chaos.summary.json`, `chaos.window` | `t, succeeded, kills` every ~2 s; totals; start/end epoch | the container chaos run: `docker kill` a worker or scheduler container every ~4 s for 40 s while jobs and a 2-second cron schedule run. Computed from the **database**, not Prometheus (see below) |
+| `batching.csv` | `mode, workers, run, jobs, seconds, jobs_per_second, commits_per_job` | completion batching: the same drain as `scale.csv` with batching off, with group commit, and with group commit plus a 5 ms linger, 5 runs per cell, plus Postgres commits per job from `pg_stat_database.xact_commit`. Written by [perf-batching.sh](../../scripts/perf-batching.sh) |
 | `window.txt` | `start_epoch end_epoch` | the whole collection, used to time the Grafana screenshots |
 
 ## Reading the numbers honestly
 
 - **One shared machine.** The stack, Postgres, k6 and the load generator all run on one WSL2 machine (12 logical CPUs, durable Postgres with `fsync=on`). These show the *shape* of the system, not a capacity claim.
-- **Throughput is a Postgres commit rate.** Every job costs one durable commit when it completes, so a single database sets the ceiling; adding worker containers beyond a point adds little. The first optimisation would be batching completion writes ([OPERATIONS.md](../OPERATIONS.md#what-breaks-first)).
+- **Throughput is a Postgres commit rate.** Every job costs one durable commit when it completes, so a single database sets the ceiling; adding worker containers beyond a point adds little. Batching completion writes cut commits per job by 3.5x and raised 8-worker throughput by about half ([OPERATIONS.md](../OPERATIONS.md#completion-batching)); it did not remove the ceiling, so commit rate is one limit among several.
 - **Results vary with host load.** Runs on a quiet machine and on a busy one differed by an order of magnitude in tail latency; the repository's earlier numbers were taken on a busier machine than the ones here. Compare runs taken under similar conditions, and rerun on your own hardware.
 - **Prometheus is blind during a crash storm.** A container that lives less than one scrape interval is never scraped, so worker-side counters (throughput, pickup latency, reaps) under-report badly while containers are being killed every few seconds. The app targets are scraped every 5 s here (15 s globally would be worse), the burst experiment is deliberately kill-free, and the chaos chart is drawn from the database, which does not have this problem. Real crashes are rarer and pods live longer, but it is a real limit of scrape-based metrics.
 - **No-op jobs** isolate the queue's own cost. Real handlers spend their time in handlers, and then worker count scales much further.

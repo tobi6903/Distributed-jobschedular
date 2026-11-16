@@ -38,6 +38,7 @@ type Metrics struct {
 	retries      *prometheus.CounterVec
 	reaped       *prometheus.CounterVec
 	deleted      prometheus.Counter
+	batchSize    prometheus.Histogram
 	httpRequests *prometheus.CounterVec
 	httpDuration *prometheus.HistogramVec
 	submitted    *prometheus.CounterVec
@@ -65,6 +66,8 @@ func New() *Metrics {
 			"Jobs recovered from expired leases (worker crash or stall).")), []string{"result"}),
 		deleted: prometheus.NewCounter(prometheus.CounterOpts(f("jobs_retention_deleted_total",
 			"Finished jobs deleted by the retention sweeper."))),
+		batchSize: prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: ns, Name: "complete_batch_size",
+			Help: "Jobs recorded as succeeded per batched write (worker completion batching).", Buckets: []float64{1, 2, 5, 10, 20, 50, 100}}),
 		httpRequests: prometheus.NewCounterVec(prometheus.CounterOpts(f("http_requests_total",
 			"HTTP requests.")), []string{"route", "method", "code"}),
 		httpDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: ns, Name: "http_request_duration_seconds",
@@ -87,7 +90,7 @@ func New() *Metrics {
 	m.reaped.WithLabelValues("dead")
 	m.schedFires.WithLabelValues("created")
 	m.schedFires.WithLabelValues("duplicate_prevented")
-	reg.MustRegister(m.rejected, m.schedFires, m.isLeader, m.claimed, m.pickup, m.duration, m.retries, m.reaped, m.deleted,
+	reg.MustRegister(m.rejected, m.schedFires, m.isLeader, m.claimed, m.pickup, m.duration, m.retries, m.reaped, m.deleted, m.batchSize,
 		m.httpRequests, m.httpDuration, m.submitted)
 	return m
 }
@@ -122,6 +125,8 @@ func (o *workerObserver) Reaped(retried, dead int) {
 }
 
 func (o *workerObserver) Deleted(n int) { o.m.deleted.Add(float64(n)) }
+
+func (o *workerObserver) CompleteBatch(n int) { o.m.batchSize.Observe(float64(n)) }
 
 // APIObserver adapts Metrics to api.Observer.
 func (m *Metrics) APIObserver() *apiObserver { return &apiObserver{m} }

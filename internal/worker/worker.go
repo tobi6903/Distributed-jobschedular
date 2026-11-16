@@ -59,6 +59,8 @@ type Observer interface {
 	Finished(queue, jobType, outcome string, d time.Duration)
 	Reaped(retried, dead int)
 	Deleted(n int)
+	// CompleteBatch reports one flush of batched success writes (size = jobs in the statement).
+	CompleteBatch(size int)
 }
 
 type nopObserver struct{}
@@ -66,6 +68,7 @@ type nopObserver struct{}
 func (nopObserver) Claimed(string, int, []time.Duration)           {}
 func (nopObserver) Finished(string, string, string, time.Duration) {}
 func (nopObserver) Reaped(int, int)                                {}
+func (nopObserver) CompleteBatch(int)                              {}
 func (nopObserver) Deleted(int)                                    {}
 
 // Config tunes a worker. Zero values are replaced by defaults (see withDefaults).
@@ -83,6 +86,14 @@ type Config struct {
 	Retention         time.Duration // 0 disables deletion of finished jobs
 	RetentionInterval time.Duration
 	Backoff           job.Backoff
+
+	// CompleteBatch groups "succeeded" writes into one commit (group commit: no timer, results
+	// that pile up while a write is in flight go out together). Needs a Store that implements
+	// BatchCompleter, otherwise it is ignored. Off by default.
+	CompleteBatch bool
+	// CompleteBatchLinger optionally waits this long to fill a batch. Default 0: no waiting.
+	CompleteBatchLinger time.Duration
+	CompleteBatchMax    int // most results per statement; default Concurrency
 }
 
 func (c Config) withDefaults() Config {
@@ -110,6 +121,9 @@ func (c Config) withDefaults() Config {
 	def(&c.ShutdownGrace, 30*time.Second)
 	def(&c.ReapInterval, 10*time.Second)
 	def(&c.RetentionInterval, time.Minute)
+	if c.CompleteBatchMax <= 0 {
+		c.CompleteBatchMax = c.Concurrency
+	}
 	if c.Backoff.Base == 0 {
 		c.Backoff = job.DefaultBackoff()
 	}
@@ -132,6 +146,7 @@ type Worker struct {
 	obs      Observer
 	tracer   trace.Tracer
 	rng      *rand.Rand
+	batcher  *completer // nil when batching is off
 }
 
 // Option customises a Worker.
@@ -188,6 +203,10 @@ func (w *Worker) Run(ctx context.Context) error {
 	maint.Add(1)
 	go func() { defer maint.Done(); w.maintenance(maintCtx) }()
 
+	if bc, ok := w.store.(BatchCompleter); ok && w.cfg.CompleteBatch {
+		w.batcher = newCompleter(bc, w.cfg.CompleteBatchLinger, w.cfg.CompleteBatchMax, w.obs.CompleteBatch)
+	}
+
 	sem := make(chan struct{}, w.cfg.Concurrency)
 	var inflight sync.WaitGroup
 	w.pollLoop(ctx, jobCtx, sem, &inflight)
@@ -207,6 +226,11 @@ func (w *Worker) Run(ctx context.Context) error {
 		case <-time.After(5 * time.Second):
 			err = errors.New("handlers ignored cancellation; abandoned (leases will expire)")
 		}
+	}
+	// Handlers are done (or abandoned: a late finisher falls back to a direct write), so
+	// flush whatever results are still waiting.
+	if w.batcher != nil {
+		w.batcher.stop()
 	}
 	stopMaint()
 	maint.Wait()
@@ -402,7 +426,7 @@ func (w *Worker) heartbeat(ctx context.Context, ref job.Ref, log *slog.Logger, c
 func (w *Worker) finalize(ctx context.Context, log *slog.Logger, j job.Job, ref job.Ref, herr error, cause error, timeout time.Duration) string {
 	switch {
 	case herr == nil:
-		return w.write(ctx, log, "complete", OutcomeSucceeded, func() error { return w.store.Complete(ctx, ref) })
+		return w.write(ctx, log, "complete", OutcomeSucceeded, func() error { return w.complete(ctx, ref) })
 
 	case errors.Is(cause, errLeaseLost):
 		// Someone else owns the job now. Any write would be rejected, so don't try.
@@ -429,6 +453,15 @@ func (w *Worker) finalize(ctx context.Context, log *slog.Logger, j job.Job, ref 
 	}
 	log.Warn("job attempt failed", "err", herr, "next_status", p.Status, "retry_in", p.Delay.String())
 	return w.write(ctx, log, "fail", outcome, func() error { return w.store.Fail(ctx, ref, p) })
+}
+
+// complete records a success, through the batcher when one is running.
+func (w *Worker) complete(ctx context.Context, ref job.Ref) error {
+	direct := func() error { return w.store.Complete(ctx, ref) }
+	if w.batcher == nil {
+		return direct()
+	}
+	return w.batcher.complete(ctx, ref, direct)
 }
 
 // write retries transient DB errors a few times. If it still fails the lease will expire and

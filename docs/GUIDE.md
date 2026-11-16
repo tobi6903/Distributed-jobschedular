@@ -296,6 +296,22 @@ Tenants are split into disjoint groups (one per tenant with its own rule, one sh
 
 CPU is a poor signal for a queue worker (idle workers and a huge backlog can coexist). **KEDA** scales workers on the thing that matters: the runnable backlog, via a SQL query (`pending`/`retrying` with `run_at <= now()`, so delayed jobs don't trigger premature scale-up). Scale-down is deliberately slow because each removed pod must drain its jobs.
 
+### 3.13 Completion batching (group commit)
+
+**Problem.** Every job ends with a durable commit, and one Postgres commits for the whole fleet, so past a few workers more containers just contend (the measured peak was 4 workers, then a fall).
+
+**Solution.** Workers hand their "succeeded" results to a per-worker flusher that writes everything accumulated in **one** statement, then immediately everything that piled up while that write was running (`CompleteBatch` in [store.go](../internal/queue/store.go), `completer` in [completer.go](../internal/worker/completer.go)). No timer: an idle worker adds no latency, and under load the batch grows to match the commit latency, the same idea as Postgres's own group commit.
+
+**Why it is still correct.**
+
+- The fence is the same, applied **per row**: `WHERE j.id = r.id AND status='running' AND locked_by = r.worker AND attempts = r.attempts`. A zombie's row simply does not match; only that job gets `ErrLeaseLost`.
+- The job's goroutine blocks until its batch is committed, so its execution slot and lease are held until the result is durable. Shutdown draining and the reaper are unchanged.
+- A statement-level error means nothing committed, so every waiter retries through the same retry loop as before.
+
+**What I measured, including the part that did not work.** My first version waited a fixed 5 ms to fill batches. It cut commits per job from 1.0 to 0.25 and was *slower* at 1 and 2 workers, because every job kept its slot for the wait. Removing the timer fixed that. Final result: commits per job fall 3.1 to 3.6x everywhere; throughput rises 51% at 8 workers (3,997 to 6,054 jobs/s) and shows no gain beyond noise at 1 to 4. Throughput rose less than commits fell, so commit rate was a limit but not the only one. That is why it is opt-in (`WORKER_COMPLETE_BATCH`).
+
+**The proof to point at.** `TestCompleteBatchIsFencedPerRow`, and the mutation check: deleting `AND j.attempts = r.attempts` makes it fail. Charts: [docs/perf](perf/README.md). Design: [DESIGN.md section 19](DESIGN.md#19-completion-batching-group-commit).
+
 ---
 
 ## 4. A guided tour of the code (read in this order)
@@ -354,7 +370,7 @@ All measured on one WSL2 machine with 12 logical CPUs, Postgres 16 with durable 
 | Burst | 60,000 jobs inserted at once, drained by 4 workers in 47 s | same |
 | Submit latency | p95 12 to 17 ms from 100 to 500 req/s with no failures (this run; an earlier run on a busier machine gave 71 ms at 400 req/s) | same |
 
-**What the throughput number does and does not say.** These are *no-op* jobs, so it measures the queue's overhead, not your workload. Real jobs spend their time in handlers, and then worker count scales much better. The right way to say it: "the queue itself sustains on the order of a thousand jobs per second per Postgres primary on commodity hardware, bounded by commit rate; the first optimisation would be batching completion writes."
+**What the throughput number does and does not say.** These are *no-op* jobs, so it measures the queue's overhead, not your workload. Real jobs spend their time in handlers, and then worker count scales much better. The right way to say it: "the queue itself sustains on the order of a thousand jobs per second per worker container and a few thousand per Postgres primary on commodity hardware. Commit rate was the first limit, so I built group commit for completions: commits per job fell about 3.5x and 8-worker throughput rose 51%, from 3,997 to 6,054 jobs/s. At 1 to 4 workers there was no measurable gain, so it is opt-in. It did not remove the ceiling." See section 3.13.
 
 ---
 
@@ -375,7 +391,7 @@ No, and nobody can in general (section 3.4). I provide at-least-once and bound d
 A number that increases on each claim, checked on every write, so a worker that lost its lease cannot overwrite the new owner's result. Needed because a leased worker can't *know* its lease expired (a pause looks like nothing to the paused process).
 
 **Q: How does it scale? What breaks first?**
-Stateless API and workers scale horizontally. The first limit is Postgres commit rate, then dead tuples and vacuum (every job writes about three row versions plus heartbeats; I tuned autovacuum in a migration), then connection count (pods x pool size must stay under `max_connections`), then claim-index contention. Fixes in order: batch completions, bigger instance, PgBouncer, shard queues or tenants across databases.
+Stateless API and workers scale horizontally. The first limit is Postgres commit rate, then dead tuples and vacuum (every job writes about three row versions plus heartbeats; I tuned autovacuum in a migration), then connection count (pods x pool size must stay under `max_connections`), then claim-index contention. Fixes in order: batch completions (built, opt-in), bigger instance, PgBouncer, shard queues or tenants across databases.
 
 **Q: How do you avoid the thundering herd?**
 Jittered exponential backoff for retries, jittered poll intervals so a fleet started together does not poll in lockstep, and slow KEDA scale-down.
@@ -413,7 +429,7 @@ Run the real Postgres semantics (no mocks for `SKIP LOCKED`), run with `-race`, 
 So the database itself rejects impossible states (a `running` job with no lease). A bug in application code cannot produce them. A test confirms it.
 
 **Q: What would you change if you had another week?**
-Batch completion writes (biggest throughput win); `LISTEN/NOTIFY` to cut idle pickup latency; weighted fair shares and API request-rate limiting; priority aging; the outbox pattern so jobs can be enqueued transactionally from other services.
+`LISTEN/NOTIFY` to cut idle pickup latency; weighted fair shares and API request-rate limiting; priority aging; the outbox pattern so jobs can be enqueued transactionally from other services.
 
 ---
 
@@ -460,7 +476,7 @@ Interviewers trust candidates who name their own weak points before being asked:
 - **Fairness is rule-based, not weighted**: per-tenant caps, rates and backlog limits exist, but groups get an equal chance rather than configurable shares, and the API has no request-rate limit.
 - **Strict priority can starve** low-priority jobs.
 - **Handlers are in-process Go functions** with no sandboxing; a handler can still take down a worker (the attempt budget stops infinite crash loops).
-- **Completion writes are one per job**, not batched, which is the first throughput limit.
+- **Completion batching is opt-in and only helps at scale** (+51% at 8 workers, nothing measurable at 1 to 4), and it did not remove the Postgres ceiling.
 - **Idle pickup latency** is up to the poll interval (no `LISTEN/NOTIFY` yet).
 - **Never run against a managed cloud cluster**: it was verified on kind with an in-cluster demo Postgres, not against a cloud database, a real ingress controller or a secret manager. The GitHub Actions workflows were validated statically but have not run yet.
 

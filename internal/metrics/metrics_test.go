@@ -64,6 +64,27 @@ func TestWorkerObserver(t *testing.T) {
 	}
 }
 
+func TestCompleteBatchSizeHistogram(t *testing.T) {
+	m := New()
+	o := m.WorkerObserver()
+	o.CompleteBatch(1)
+	o.CompleteBatch(16)
+	mfs, err := m.Registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() == "jobscheduler_complete_batch_size" {
+			h := mf.GetMetric()[0].GetHistogram()
+			if h.GetSampleCount() != 2 || h.GetSampleSum() != 17 {
+				t.Fatalf("count=%d sum=%v, want 2 and 17", h.GetSampleCount(), h.GetSampleSum())
+			}
+			return
+		}
+	}
+	t.Fatal("jobscheduler_complete_batch_size is not registered")
+}
+
 func TestAPIObserverBoundsCardinality(t *testing.T) {
 	m := New()
 	o := m.APIObserver()

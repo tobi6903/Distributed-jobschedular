@@ -75,6 +75,9 @@ services:
       <<: *app-env
       WORKER_CONCURRENCY: "20"
       WORKER_SHUTDOWN_GRACE: 30s
+      # Group "succeeded" writes into one commit (group commit). See docs/OPERATIONS.md "Completion batching".
+      WORKER_COMPLETE_BATCH: "${WORKER_COMPLETE_BATCH:-false}"
+      WORKER_COMPLETE_BATCH_LINGER: "${WORKER_COMPLETE_BATCH_LINGER:-0s}"
       DB_MAX_CONNS: "${WORKER_DB_MAX_CONNS:-20}"
     deploy:
       replicas: 2

@@ -277,6 +277,95 @@ func TestCompleteIsFenced(t *testing.T) {
 	}
 }
 
+// CompleteBatch applies the SAME fence as Complete, per row: in a mixed batch the valid rows
+// complete, and every stale one is rejected individually without disturbing its neighbours.
+func TestCompleteBatchIsFencedPerRow(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	for i := 0; i < 5; i++ {
+		mustEnqueue(t, s, nj("email"))
+	}
+	claimed, err := s.Claim(ctx, "default", "w1", 5, time.Minute)
+	if err != nil || len(claimed) != 5 {
+		t.Fatalf("claim: %d %v", len(claimed), err)
+	}
+	refs := make([]job.Ref, 5)
+	for i, c := range claimed {
+		refs[i] = c.Ref()
+	}
+	refs[1].WorkerID = "someone-else" // wrong owner
+	refs[3].Attempts = 99             // wrong attempt (a zombie holding an old claim)
+
+	ok, err := s.CompleteBatch(ctx, refs)
+	if err != nil {
+		t.Fatalf("batch: %v", err)
+	}
+	want := []bool{true, false, true, false, true}
+	for i := range want {
+		if ok[i] != want[i] {
+			t.Errorf("ok[%d] = %v, want %v", i, ok[i], want[i])
+		}
+	}
+	for i, c := range claimed {
+		got, _ := s.Get(ctx, "acme", c.ID)
+		if want[i] && (got.Status != job.StatusSucceeded || got.FinishedAt == nil || got.LockedBy != nil) {
+			t.Errorf("job %d should be succeeded: %+v", i, got)
+		}
+		if !want[i] && (got.Status != job.StatusRunning || got.LockedBy == nil) {
+			t.Errorf("rejected job %d must be untouched (still running, still leased): %+v", i, got)
+		}
+	}
+	// Replaying the same batch must complete nothing: every row is already finished.
+	ok, err = s.CompleteBatch(ctx, refs)
+	if err != nil {
+		t.Fatalf("replayed batch: %v", err)
+	}
+	for i, v := range ok {
+		if v {
+			t.Errorf("replayed batch: ok[%d] must be false", i)
+		}
+	}
+}
+
+// The zombie scenario through the batch path: a worker whose lease expired and whose job was
+// reclaimed by someone else cannot complete it by batching.
+func TestCompleteBatchStaleWorkerCannotWriteAfterReclaim(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	mustEnqueue(t, s, nj("email"))
+	mustEnqueue(t, s, nj("email"))
+
+	c1, _ := s.Claim(ctx, "default", "zombie", 2, 50*time.Millisecond)
+	zombie := []job.Ref{c1[0].Ref(), c1[1].Ref()}
+	time.Sleep(120 * time.Millisecond)
+	if res, err := s.Reap(ctx, 10); err != nil || res.Retried != 2 {
+		t.Fatalf("reap: %+v %v", res, err)
+	}
+	c2, _ := s.Claim(ctx, "default", "healthy", 2, time.Minute)
+	if len(c2) != 2 {
+		t.Fatalf("reclaim: %+v", c2)
+	}
+
+	ok, err := s.CompleteBatch(ctx, zombie)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok[0] || ok[1] {
+		t.Fatalf("zombie batch must complete nothing: %v", ok)
+	}
+	ok, err = s.CompleteBatch(ctx, []job.Ref{c2[0].Ref(), c2[1].Ref()})
+	if err != nil || !ok[0] || !ok[1] {
+		t.Fatalf("healthy batch: %v %v", ok, err)
+	}
+}
+
+func TestCompleteBatchEmpty(t *testing.T) {
+	s := newStore(t)
+	if ok, err := s.CompleteBatch(context.Background(), nil); err != nil || len(ok) != 0 {
+		t.Fatalf("empty batch: %v %v", ok, err)
+	}
+}
+
 // A zombie worker whose lease expired must not be able to overwrite the new owner's result.
 func TestStaleWorkerCannotWriteAfterReclaim(t *testing.T) {
 	ctx := context.Background()

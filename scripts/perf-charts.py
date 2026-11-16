@@ -272,6 +272,65 @@ def chart_burst():
     save(fig, "perf-burst-metrics.png")
 
 
+# ---------------------------------------------------------------- 6. completion batching: before / after
+def chart_batching():
+    rows = read_csv("batching.csv")
+    modes = [m for m in ("off", "group", "linger5ms") if any(r["mode"] == m for r in rows)]
+    label = {"off": "one commit per job (off)", "group": "group commit", "linger5ms": "group commit + 5 ms linger"}
+    color = {"off": BLUE, "group": ORANGE, "linger5ms": AQUA}
+    tput, cpj = defaultdict(list), defaultdict(list)
+    for r in rows:
+        k = (r["mode"], int(r["workers"]))
+        tput[k].append(float(r["jobs_per_second"]))
+        cpj[k].append(float(r["commits_per_job"]))
+    ws = sorted({w for _, w in tput})
+    runs = len(tput[(modes[0], ws[0])])
+    jobs = int(rows[0]["jobs"])
+    top = ws[-1]
+    gain = statistics.median(tput[("group", top)]) / statistics.median(tput[("off", top)]) - 1
+    c_off, c_on = statistics.median(cpj[("off", top)]), statistics.median(cpj[("group", top)])
+
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(11.2, 5.0), gridspec_kw={"width_ratios": [1.7, 1]})
+    fig.subplots_adjust(left=0.07, right=0.98, top=0.76, bottom=0.21, wspace=0.22)
+    head(fig, "Completion batching: fewer commits, more throughput when commits are the limit",
+         f"{jobs:,} no-op jobs preloaded, {runs} runs per cell (bar = median, dots = runs). At {top} workers group commit "
+         f"changes throughput by {gain:+.0%} and cuts Postgres commits per job from {c_off:.2f} to {c_on:.2f}. "
+         "At 1 to 4 workers there is no gain beyond run-to-run noise, and the 5 ms linger costs throughput at 1 and 2: batching pays only once commits are the bottleneck.")
+    width = 0.8 / len(modes)
+    for mi, m in enumerate(modes):
+        for i, w in enumerate(ws):
+            x = i + (mi - (len(modes) - 1) / 2) * width
+            vals = tput[(m, w)]
+            med = statistics.median(vals)
+            ax.bar(x, med, width=width * 0.92, color=color[m], zorder=3, linewidth=0, label=label[m] if i == 0 else None)
+            ax.scatter([x + 0.04 * (k - (len(vals) - 1) / 2) for k in range(len(vals))], sorted(vals), s=14,
+                       color=SURFACE, edgecolor=INK2, linewidth=0.9, zorder=4)
+            ax.text(x, max(vals) + 160, f"{med:,.0f}", ha="center", va="bottom", fontsize=8, color=INK, zorder=5)
+    ax.set_xticks(range(len(ws)), [f"{w} worker{'s' if w > 1 else ''}" for w in ws])
+    ax.set_ylabel("jobs per second")
+    ax.set_ylim(0, max(max(v) for v in tput.values()) * 1.15)
+    ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:,.0f}"))
+    ax.legend(frameon=False, loc="upper left", labelcolor=INK2, fontsize=8.5)
+    ax.set_title("Backlog drain throughput", loc="left", fontsize=10, color=INK2, pad=6)
+    style_axis(ax)
+
+    for mi, m in enumerate(modes):
+        ax2.plot(range(len(ws)), [statistics.median(cpj[(m, w)]) for w in ws], color=color[m], linewidth=2.2,
+                 marker="o", markersize=5, zorder=3)
+        short = {"off": "one per job", "group": "group commit", "linger5ms": "+ 5 ms linger"}[m]
+        dy = {"off": 0.0, "group": 0.045, "linger5ms": -0.045}[m]     # nudge the two close lines apart
+        ax2.text(len(ws) - 1 + 0.1, statistics.median(cpj[(m, ws[-1])]) + dy, short, color=INK2,
+                 fontsize=8, va="center", ha="left")
+    ax2.set_xticks(range(len(ws)), [str(w) for w in ws])
+    ax2.set_xlabel("worker containers")
+    ax2.set_xlim(-0.2, len(ws) - 1 + 1.5)
+    ax2.set_ylim(0, 1.25)
+    ax2.set_title("Postgres commits per job (the mechanism)", loc="left", fontsize=10, color=INK2, pad=6)
+    style_axis(ax2)
+    foot(fig, ENV + "  Source: docs/perf/data/batching.csv (scripts/perf-batching.sh). Commits come from pg_stat_database.xact_commit.")
+    save(fig, "perf-completion-batching.png")
+
+
 if __name__ == "__main__":
     needed = ["scale.csv", "load.csv", "pool.csv", "chaos.csv", "chaos.summary.json", "burst.json", "burst.window"]
     missing = [n for n in needed if not (DATA / n).exists()]
@@ -282,3 +341,5 @@ if __name__ == "__main__":
     chart_pool()
     chart_chaos()
     chart_burst()
+    if (DATA / "batching.csv").exists():
+        chart_batching()

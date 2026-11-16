@@ -29,6 +29,8 @@ All configuration is environment variables, validated at startup (all errors rep
 | `WORKER_DEFAULT_TIMEOUT` | 5m | Per-job timeout when the job sets none |
 | `WORKER_SHUTDOWN_GRACE` | 30s | Drain time on SIGTERM before cancelling stragglers |
 | `WORKER_REAP_INTERVAL` | 10s | How often expired leases are recovered |
+| `WORKER_COMPLETE_BATCH` | false | Group "succeeded" writes into one commit (group commit). See [Completion batching](#completion-batching) |
+| `WORKER_COMPLETE_BATCH_LINGER` / `_MAX` | 0 / = concurrency | Optional extra wait to fill a batch (leave at 0) / most results per statement |
 | `RETENTION` | 168h | Finished jobs are deleted after this (also the idempotency-key dedup window) |
 | `BACKOFF_BASE` / `BACKOFF_CAP` | 5s / 1h | Retry delay: `min(cap, base*2^(n-1))` with equal jitter |
 | `SCHEDULER_TICK` | 1s | How often the leader looks for due schedules |
@@ -66,6 +68,27 @@ The same applies to workers, where every finished job needs a connection to reco
 
 Handlers are usually I/O bound, so `WORKER_CONCURRENCY` can be much higher than CPU count. Size replicas so that `replicas x concurrency` covers your peak arrival rate times mean job duration (Little's law: in-flight = rate x duration). Example: 200 jobs/s of 2s jobs needs 400 slots, i.e. 20 workers at concurrency 20. KEDA's `jobsPerReplica` target (default 100) should be roughly `concurrency x (seconds of backlog you tolerate) / mean job seconds`.
 
+### Completion batching
+
+`WORKER_COMPLETE_BATCH=true` (Helm: `worker.completeBatch`) makes each worker write its "succeeded" results in groups instead of one commit per job. It is **off by default** because it only pays once commits are the bottleneck.
+
+**How it works.** Each finishing job hands its result to a per-worker flusher and waits. The flusher writes everything that has accumulated in one statement (`UPDATE ... FROM unnest(ids, workers, attempts)`), then immediately writes whatever accumulated while that write was in flight. There is no timer, so an idle worker adds no latency, and under load the batch size follows the commit latency by itself. The fence is applied per row, so a job whose lease was lost is rejected on its own and never affects its neighbours. Failures, retries and releases are still written one at a time.
+
+**Measured** (20,000 no-op jobs, 5 runs per cell, medians; see [the chart](../README.md#completion-batching-fewer-commits-more-throughput-once-commits-are-the-limit)):
+
+| Workers | One commit per job | Group commit | Commits per job (off / on) |
+|---|---|---|---|
+| 1 | 1,156 jobs/s | 1,159 | 1.01 / 0.28 |
+| 2 | 2,015 | 1,869 | 0.96 / 0.30 |
+| 4 | 3,234 | 3,292 | 0.91 / 0.29 |
+| 8 | 3,997 | **6,054 (+51%)** | 0.84 / 0.24 |
+
+**When to turn it on:** many workers on one database (the gain appears around 8 worker containers of 20 slots on the test machine), with `rate(pg_stat_database_xact_commit[1m])` high and the database, not the handlers, the limit. **When not to:** a handful of workers or slow handlers; there it changes nothing you can measure, and at 1 to 2 workers the numbers were within noise of the baseline.
+
+**What it costs.** A successful job is recorded up to one write later than before, so a crash in that window re-runs the job. That is inside the at-least-once contract (the lease is far longer than the window), and the container chaos test passes with it on: 8 SIGKILLs, 12,000 of 12,000 jobs succeeded, 0 cron duplicates. A job still holds its execution slot and lease until its result is committed, so graceful shutdown is unchanged (verified: `docker stop` mid-job exits 0 and every job finishes on attempt 1).
+
+**What it does not do.** Commits per job fell by 3.5x at 8 workers but throughput rose by 1.5x, not 3.5x: the remaining cost is the row updates, WAL volume and a host shared by every container. So commit rate was *a* limit, not the only one. Do not set `WORKER_COMPLETE_BATCH_LINGER`: a fixed 5 ms wait cost throughput at 1 and 2 workers (958 vs 1,156 and 1,595 vs 2,015 jobs/s) for no gain over plain group commit. The batch size is observable as `jobscheduler_complete_batch_size`.
+
 ### Lease length
 
 Longer leases mean slower crash recovery (a dead worker's jobs wait up to lease + reap interval); shorter leases mean more heartbeat traffic and more false reclaims under GC pauses or CPU throttling. 30s is a sane default. Keep `heartbeat <= lease/3` (enforced at startup).
@@ -74,7 +97,7 @@ Longer leases mean slower crash recovery (a dead worker's jobs wait up to lease 
 
 In the order you will hit them as load grows. The measured numbers come from the README's Performance section (`scripts/perf-collect.sh`, one 12-CPU WSL2 box, durable Postgres); they vary between runs.
 
-1. **Postgres commit rate (about 1,000 to 3,300 jobs/s on that box, peaking at 4 worker containers and then falling).** Each job costs three durable writes: INSERT, claim UPDATE (batched), completion UPDATE (one per job). Completion is the dominant cost: throughput tracked the commit rate, and adding workers past 4 gave diminishing returns. **Mitigations, in order:** batch completions (collect finished jobs and `UPDATE ... WHERE id = ANY(...)` once per tick, not implemented to keep fencing simple); faster storage and a bigger instance; `synchronous_commit=off` for this database if you can tolerate losing the last few ms of commits (acceptable here because loss of a *completion* only causes a re-run, never a lost job, but a lost *enqueue* would be a lost job: use it only after weighing that); then sharding queues or tenants across databases.
+1. **Postgres commit rate (about 1,000 to 3,300 jobs/s on that box, peaking at 4 worker containers and then falling).** Each job costs three durable writes: INSERT, claim UPDATE (batched), completion UPDATE (one per job). Completion is the dominant cost: throughput tracked the commit rate, and adding workers past 4 gave diminishing returns. **Mitigations, in order:** [batch completions](#completion-batching) (implemented, opt-in: +51% at 8 workers, with the fence applied per row); faster storage and a bigger instance; `synchronous_commit=off` for this database if you can tolerate losing the last few ms of commits (acceptable here because loss of a *completion* only causes a re-run, never a lost job, but a lost *enqueue* would be a lost job: use it only after weighing that); then sharding queues or tenants across databases.
 2. **Dead tuples and vacuum.** Every job produces about 3 row versions, plus one per heartbeat. `status` and `locked_until` are in index predicates or keys, so these updates are not HOT. If autovacuum falls behind, the partial claim index fills with dead entries and claim latency climbs. Migration `000006` already makes autovacuum aggressive on `jobs`. Watch `n_dead_tup` and `last_autovacuum`; keep `RETENTION` short. This is the failure that looks like "the queue got slow for no reason".
 3. **Connections** (see sizing). Symptoms: `too many clients`, API 503s, workers logging `claim failed`.
 4. **Claim contention.** `SKIP LOCKED` avoids blocking, but every worker scans the head of the same index. Batch claiming amortises round trips. At very high worker counts, split queues (each queue has its own index range) or tenants across databases.
