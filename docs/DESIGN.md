@@ -402,7 +402,7 @@ That run found real defects, none visible before. They are worth listing because
 
 Verified on the cluster: KEDA scaling up (2 -> 4 -> 8) and down (8 -> 6 -> 4 -> 2); crash recovery (0 lost, cron exact); rolling deploys that drain in-flight jobs; forced release of jobs longer than the grace (attempt refunded); node drains that respect PodDisruptionBudgets; NetworkPolicy blocking and allowing; Argo CD deploying the chart, healing drift, rolling out a commit and rolling back on `git revert`.
 
-After the fix the `images` jobs passed, pushed four public images to GHCR, and `promote` committed the new tag to `values-prod.yaml`; the published images were pulled, run and re-scanned. Still unverified: rolling the *published* images out through Argo CD; a managed cloud cluster, real ingress controller, external database and secret manager; the API HPA scaling out under load.
+After the fix the `images` jobs passed, pushed four public images to GHCR, and `promote` committed the new tag to `values-prod.yaml`; the published images were pulled, run and re-scanned. The published images were later rolled out through Argo CD on kind (`PUBLISHED=1 make argocd-verify`; the registry and sha tag come from `origin/main`, and the script asserts that every app container runs a `ghcr.io/...:sha-...` image pulled by digest, so a silent fall back to local images fails). Still unverified: a managed cloud cluster, real ingress controller, external database and secret manager; Argo CD reading the real GitHub repo over HTTPS (the check serves a throwaway git repo inside the cluster); an image-tag change as the rolled-out commit (it rolled out a value change). (The API HPA scaling out under load was verified later with `make hpa-verify`: 2 -> 4 replicas, load spread across all four pods. A first attempt through `kubectl port-forward` looked like a failure of balancing, one pod at 1117m and three at 1m, but port-forward pins every connection to one pod; the script therefore generates load inside the cluster through the Service.)
 
 ## 19. Completion batching (group commit)
 
@@ -428,3 +428,74 @@ In the worker, each finishing job sends its ref to a `completer` and **blocks un
 **Tradeoffs.** A success is recorded up to one write later, so a crash in that window re-runs the job: within at-least-once, and bounded by one statement. It is opt-in (`WORKER_COMPLETE_BATCH`) because it is neutral at small scale. Only successes are batched: failures and releases are rare and carry per-job parameters.
 
 **Proof.** `CompleteBatch` is tested per row (mixed batch with wrong-owner and wrong-attempt rows; replaying a batch completes nothing; a zombie cannot complete through the batch path). **Mutation check:** removing `AND j.attempts = r.attempts` made `TestCompleteBatchIsFencedPerRow` fail. The 50-worker, 100,000-job test passes with batching on (0 duplicates, 0 lost), as does container chaos (8 SIGKILLs, 12,000 of 12,000 succeeded, 101 recovered, 0 cron duplicates or gaps) and a graceful stop mid-job.
+
+## 20. The cached plan trap (found by investigating uneven burst claims)
+
+**Symptom.** In the first burst chart, two workers claimed far more than the other two for about 30 s, while the total looked right. I first called it "not a metrics artifact, cause unknown". That was wrong on both counts.
+
+**Method.** Stop trusting the metric under investigation. Each worker logs a line per finished job with a timestamp, so counting log lines per worker per second gives ground truth that does not go through Prometheus. Then reproduce the original conditions (two long-running workers, two scaled out), then change one variable at a time.
+
+**Finding 1: a metrics artifact.** With ground truth even (15,221 / 14,986 / 14,871 / 14,922 jobs, equal per-second rates from the second second), Prometheus still showed the least busy worker at 41 to 60% of the busiest for about 14 s. A 20 s `rate()` window needs 20 s to fill, and `jobs_claimed_total` was created lazily, so a worker that had never claimed anything had no series until its first claim and everything before the first scrape was invisible. Same root cause as the reaped-counter bug. Fix: `workerObserver.Prime` creates the claim and pickup series per queue, and the `succeeded` duration series per queue and type, at startup (`worker.New` calls it through an optional `Primer` interface). Not every outcome is primed, because that would multiply the duration histogram's series by six per type.
+
+**Finding 2: a real slowdown, and the original imbalance with it.** Some bursts were genuinely slow, and in those runs the per-worker totals really were unequal (up to 12,967 to 18,154 jobs). The discriminating observation was CPU: during the slow phase **Postgres was at about 400% while the workers were at 2 to 3%**, with only four active backends (one per worker) and no lock or WAL waits. The workers were waiting for four claim queries that each burned a core.
+
+**Cause.** `pgx` prepares each statement per connection. After five executions Postgres may switch a prepared statement to a generic plan and cache it. A fresh worker polls the empty table every second, so it adopts a generic plan made from empty-table statistics. For the claim statement, `UPDATE ... FROM picked` is then planned as a hash join against a **sequential scan of all of `jobs`** (16.7 ms, versus 0.2 ms for the index plan, measured by forcing a generic plan by hand). The plan stays cached until something invalidates it, in practice autovacuum's next analyze of the table, up to about a minute later. That is why the slow phase lasts 30 to 55 s, ends abruptly, and does not happen every time. Long-lived workers had adopted their plan when the table was large and never hit it.
+
+**What was ruled out.** Connection setup (all 84 connections existed by t=6 s; Postgres limit 200). Checkpoints (several fast runs overlapped a checkpoint and the slowest run did not). A rebuild of the images beforehand (a burst straight after a no-cache build was fast). Stale statistics alone (the claim plan is an index scan, 0.2 to 0.35 ms, with or without `ANALYZE`). And disabling autovacuum with a manual `ANALYZE` at t=24 s did not reproduce the slowdown, because those workers were long-lived: the trap needs a freshly adopted plan, not just missing statistics.
+
+**Causal test.** The same cold burst, 3 runs each, alternating: with `plan_cache_mode=force_custom_plan` on the workers' connections 26, 31, 31 s; with the default 65, 80, 83 s. After the code fix: 31, 38, 34 s. `scripts/perf-cold-burst.sh` reproduces it side by side (an explicit `plan_cache_mode=auto` in the DSN restores the old behaviour): median 61 s before, 29 s after, 4 runs each.
+
+**Fix.** `queue.Connect` sets `plan_cache_mode=force_custom_plan` on every pooled connection unless the connection string already chooses one. Alternatives considered: `QueryExecModeExec` for the claim only (more surgical, but leaves other stats-sensitive statements such as the reaper exposed, and changes parameter encoding); rewriting the claim as a `ctid`-based update (always a TID scan, but couples the core query to a physical detail); `MinConns` (irrelevant, connections were not the problem). **Cost:** planning on every execution. Not visible at the measured scale (fixed runs match the warm baseline); worth rechecking if statements become complex.
+
+**What is not proven.** The slow runs did not capture the cached plan itself (that would need `auto_explain` in the target database), so the chain "cached generic plan, hash join, seq scan" rests on the CPU profile, the hand-forced plan and the on/off experiment, not on a photograph of the bad plan. One pre-fix run was fast (21 s), consistent with an intermittent trap but not proof of it.
+
+**Lesson.** A benchmark number that varies by 3x between identical runs is a finding, not noise. Two things were hiding each other: a metric that exaggerated the effect and a real effect that the metric made look like a metric problem.
+
+
+## 21. Wake-up notifications (LISTEN/NOTIFY)
+
+**Problem.** An idle worker finds new work only by polling, so a job submitted to an idle fleet waits up to one poll interval (1 s by default; a mean of about half of that) before anyone looks. Polling also costs a query per worker per interval even when nothing is queued. Shortening the interval trades the first problem for the second.
+
+**Decision.** Workers `LISTEN` on a Postgres channel; the API and the scheduler send a notification when a job becomes runnable. A notification **is only a hint that ends an idle sleep early**. The worker then runs exactly the same claim query (`FOR UPDATE SKIP LOCKED`), so a notification changes *when* a worker looks and never *what it may claim*. Nothing about correctness depends on a notification arriving, which is the property that makes this safe to add to a queue whose guarantee is at-least-once.
+
+**Mechanism** (`internal/queue/notify.go`).
+
+- **Producer: `Notifier`, coalesced.** `NOTIFY` takes a lock at commit that serializes every transaction that sent one, so a notification per inserted job (or a trigger on `jobs`) would put a single-file queue in front of the commits that already limit write throughput. Instead `Enqueue`, `Replay` and a cron fire call `Notifier.Notify(queue)` *after* their commit, and the notifier sends at most one `pg_notify` per queue per window (25 ms) from its own statement: the first job after a quiet period notifies at once (leading edge), jobs that arrive while the window is open share one notification sent when it closes (trailing edge). Sending is asynchronous and best effort, so it can neither delay nor fail an enqueue.
+- **Consumer: `Listener`.** One dedicated connection per worker (not from the pool: `LISTEN` is session state), filtered to the worker's queues. It signals a capacity-1 channel, so a burst of hints is one wake-up. On connection loss it reports unhealthy, reconnects with backoff, and signals once after reconnecting, because hints sent while it was away are gone. TCP keepalives (10 s idle, 5 s interval, 3 probes) turn a silently dropped connection into an error in about 25 s instead of the OS default of hours.
+- **Worker.** The idle wait is a select on the timer, the wake channel and shutdown. While the listener is healthy the timer is `FallbackPoll` (the poll is then only a safety net); while it is down, or after a failed claim, it is the normal `PollInterval`. `FallbackPoll` defaults to `PollInterval`, so enabling notifications never makes any pickup slower.
+
+**What is not announced.** Only a job that is runnable *now* notifies. A delayed job, a future `run_at` and a retry with backoff become runnable at a future time and nothing announces that moment; they are found by the poll. The obvious alternative, asking the database for the earliest `run_at` and sleeping until then, is not cheap here: the claim index is `(queue, priority DESC, run_at, id)`, so `min(run_at)` is one index probe per priority. The consequence is a real tradeoff that is exposed rather than hidden: raising `FallbackPoll` cuts idle queries but lets retried and scheduled jobs wait up to that long past their time.
+
+**Failure model.**
+
+| What goes wrong | What happens |
+|---|---|
+| A notification is lost (nobody was listening, the process died between commit and notify, the send failed) | The job is found by the next poll. `notifications_sent_total{result="error"}` counts failed sends |
+| The `LISTEN` connection drops | `worker_notify_listener_up` goes to 0, the worker polls at `PollInterval`, the listener reconnects and signals once |
+| The listener cannot connect at all | The worker never leaves normal polling |
+| Many workers wake for one job | One wins `SKIP LOCKED`; the rest find nothing and go back to sleep (`worker_wakeups_total{outcome="empty"}`) |
+| The connection goes through a **transaction-mode pooler** (PgBouncer) | `LISTEN` appears to succeed but notifications are not delivered, so the worker looks healthy and never wakes. Correctness is unaffected (the poll still runs), but **do not raise `FallbackPoll` behind a pooler**: the safety net would then be the only mechanism |
+
+**Measured** (`scripts/perf-notify.sh`, `scripts/perf-notify-retry.sh`; Compose on one shared WSL2 machine, so the shape is reliable and the absolute numbers are not; chart: [perf-notify-wakeups.png](images/perf-notify-wakeups.png)). Pickup latency is the worker's own `pickup_ms` log field (database clock: claim time minus `run_at`), one value per job, for 40 jobs submitted at random phases to an idle fleet with the default 1 s poll:
+
+| Workers | Mode | p50 | p95 | max |
+|---|---|---|---|---|
+| 2 | poll | 377 ms | 635 ms | 658 ms |
+| 2 | notify | **9 ms** | 11 ms | 12 ms |
+| 2 | notify + 10 s fallback | 9 ms | 12 ms | 16 ms |
+| 8 | poll | 69 ms | 273 ms | 444 ms |
+| 8 | notify | **7 ms** | 9 ms | 32 ms |
+| 8 | notify + 10 s fallback | 7 ms | 29 ms | 40 ms |
+
+- **The win shrinks as the fleet grows.** With 8 workers polling on independent timers, someone is usually about to look anyway, so polling's median is 69 ms, not 377. Notifications help most for small fleets and for the tail (p95 273 ms to 9 ms). Do not quote the 2-worker figure as "the" improvement.
+- **Notifications do not reduce idle queries by themselves.** Empty claim polls per second were 1.9 / 2.0 / 0.2 (2 workers: poll / notify / notify with a 10 s fallback) and 8.0 / 8.0 / 0.8 (8 workers). The reduction comes only from raising `FallbackPoll`, and it is paid for below.
+- **The herd is real but cheap.** At 8 workers, 41 wake-ups found a job and 288 found nothing: about 7 of 8 woken workers lose the race, as expected, each costing one cheap indexed query.
+- **Submit throughput: no detectable difference, not proof of zero.** Over 8 alternating pairs of 20,000 submits, median 1,548 req/s without and 1,500 with notifications, p99 113 ms vs 114 ms. The paired per-run differences ranged from -21% to +37% with no consistent sign (the first four pairs favoured notify, the last four poll: machine drift), so a regression of a few percent could hide inside this noise. A first 3-pair run was inconclusive in the same way, which is why it was repeated.
+- **The cost of a long fallback is real.** Retried jobs are not announced. With 12 retried jobs per mode, the second attempt started late (past its `run_at`) by a median of 320 ms with polling, 649 ms with notify and a 1 s poll (n=12, the median difference is sampling noise: both are uniform on 0 to 1 s), and 478 ms with a 10 s fallback, **but up to 8.9 s late, and 3 of 12 were more than 7 s late.** Other jobs' notifications wake workers that then also claim due retries, which is why the median looks fine; a retry that lands in a quiet period waits for the fallback poll.
+
+
+**Tradeoffs.** One extra database connection per worker (budget it: total connections gain `+1 per worker`). Up to `workers` wake-ups per notification, of which one is productive, so idle query volume does not fall unless `FallbackPoll` is raised. The hint carries only the queue name, so a worker serving several queues re-checks them in priority order as usual. It is opt-in (`NOTIFY` on the API and scheduler, `WORKER_NOTIFY` on workers; the Helm chart's `notify.enabled` sets all three) because it adds a connection and only matters when pickup latency matters; roll workers out first, since a listener with no publisher is harmless, then the publishers.
+
+**Verified on the real stack with notifications on** (Compose, `NOTIFY=true`): `make smoke` passes, and `make chaos-docker` (11 SIGKILLs of workers and schedulers, whose `LISTEN` connections die with them) ended with 4,000 of 4,000 jobs succeeded, 0 lost, 0 cron duplicates, 0 gaps (59 jobs recovered after a crash), and every restarted worker was listening again afterwards.
+
+**What is not proven.** Reconnection is tested by killing the listener's backend (`pg_terminate_backend`), not through a real primary failover. The half-open TCP case relies on the keepalive settings and was not reproduced. The transaction-pooler behaviour above is from how `LISTEN` works, not from a test against PgBouncer.

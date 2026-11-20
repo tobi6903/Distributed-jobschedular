@@ -15,6 +15,8 @@ DATABASE_URL=postgres://... HTTP_ADDR=:8080 ./bin/api
 | `HTTP_ADDR` | `:8080` | |
 | `SHUTDOWN_DELAY` | 5s | stay unready this long before closing listeners (load balancer drain) |
 | `SHUTDOWN_TIMEOUT` | 20s | in-flight request budget |
+| `NOTIFY` | false | publish a wake-up notification when a job becomes runnable (pair with the workers' `WORKER_NOTIFY`; see [Wake-up notifications](../../docs/OPERATIONS.md#wake-up-notifications)) |
+| `NOTIFY_WINDOW` | 25ms | at most one notification per queue per window |
 
 ## Lifecycle
 

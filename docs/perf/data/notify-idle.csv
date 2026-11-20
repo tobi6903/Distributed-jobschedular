@@ -1,0 +1,7 @@
+mode,workers,empty_polls_per_s,wakeups_claimed,wakeups_empty,jobs
+poll,2,1.94,0,0,40
+notify,2,1.96,32,39,40
+notify10s,2,0.20,41,41,40
+poll,8,7.95,0,0,40
+notify,8,7.98,41,288,40
+notify10s,8,0.80,34,244,40

@@ -18,4 +18,4 @@ CI builds and Trivy-scans the images, pushes them to GHCR, and commits the new t
 
 ## Verified
 
-`make argocd-verify` installs Argo CD on kind, serves a throwaway git repo inside the cluster, applies **these exact manifests** (only the repo URL rewritten) and checks: sync to Healthy, manual drift healed (an edited env var reverted, a deleted Service recreated), a commit rolled out, and a `git revert` rolled back.
+`make argocd-verify` installs Argo CD on kind, serves a throwaway git repo inside the cluster, applies **these exact manifests** (only the repo URL rewritten) and checks: sync to Healthy, manual drift healed (an edited env var reverted, a deleted Service recreated), a commit rolled out, and a `git revert` rolled back. `PUBLISHED=1 make argocd-verify` does the same with the images CI pushed to GHCR (registry and sha tag read from `origin/main`) and asserts every app container runs, and was pulled by digest from, `ghcr.io`.

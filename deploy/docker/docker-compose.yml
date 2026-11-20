@@ -8,7 +8,7 @@ name: jobscheduler
 x-app-env: &app-env
   DATABASE_URL: postgres://jobs:jobs@postgres:5432/jobs?sslmode=disable
   OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
-  LOG_LEVEL: info
+  LOG_LEVEL: ${LOG_LEVEL:-info}
 
 x-build: &build
   context: ../..
@@ -61,6 +61,7 @@ services:
       # p95 1,637 ms with 10 connections vs 146 ms with 40 (identical on an idle database).
       # See docs/OPERATIONS.md.
       DB_MAX_CONNS: "${API_DB_MAX_CONNS:-40}"
+      NOTIFY: "${NOTIFY:-false}"   # publish a wake-up when a job becomes runnable (pair with the workers' WORKER_NOTIFY)
     ports:
       - "127.0.0.1:${API_PORT:-8080}:8080"
     depends_on:
@@ -78,6 +79,10 @@ services:
       # Group "succeeded" writes into one commit (group commit). See docs/OPERATIONS.md "Completion batching".
       WORKER_COMPLETE_BATCH: "${WORKER_COMPLETE_BATCH:-false}"
       WORKER_COMPLETE_BATCH_LINGER: "${WORKER_COMPLETE_BATCH_LINGER:-0s}"
+      # Wake idle workers with LISTEN/NOTIFY instead of waiting for the next poll. See docs/OPERATIONS.md "Wake-up notifications".
+      WORKER_NOTIFY: "${NOTIFY:-false}"
+      WORKER_NOTIFY_FALLBACK_POLL: "${WORKER_NOTIFY_FALLBACK_POLL:-0s}"
+      BACKOFF_BASE: "${BACKOFF_BASE:-5s}"   # retry delay base (default 5s); scripts/perf-notify-retry.sh shortens it
       DB_MAX_CONNS: "${WORKER_DB_MAX_CONNS:-20}"
     deploy:
       replicas: 2
@@ -93,6 +98,7 @@ services:
     environment:
       <<: *app-env
       DB_MAX_CONNS: "5"   # the scheduler is light; its leader-election session is one extra connection
+      NOTIFY: "${NOTIFY:-false}"
     deploy:
       replicas: 2
     depends_on:

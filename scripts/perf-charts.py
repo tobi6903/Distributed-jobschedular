@@ -331,6 +331,147 @@ def chart_batching():
     save(fig, "perf-completion-batching.png")
 
 
+# ---------------------------------------------------------------- 7. cold-start burst: cached plan trap vs fix
+def chart_cold_burst():
+    rows = read_csv("cold-burst.csv")
+    series = read_csv("cold-burst-series.csv")
+    modes = ["auto", "custom"]
+    label = {"auto": "before the fix (generic plan can be cached)", "custom": "after the fix (custom plans)"}
+    color = {"auto": BLUE, "custom": ORANGE}
+    drain = {m: [float(r["drain_seconds"]) for r in rows if r["mode"] == m] for m in modes}
+    runs = len(drain["auto"])
+    med = {m: statistics.median(drain[m]) for m in modes}
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(11.2, 5.0), gridspec_kw={"width_ratios": [1, 1.8]})
+    fig.subplots_adjust(left=0.07, right=0.98, top=0.76, bottom=0.2, wspace=0.22)
+    head(fig, "A burst on freshly started workers: a cached query plan made it 2 to 3 times slower",
+         f"60,000 no-op jobs inserted at once, drained by 4 workers that had just started, {runs} runs per mode, "
+         f"alternating. Median drain {med['auto']:.0f} s before the fix, {med['custom']:.0f} s after. During the slow runs "
+         "Postgres sat at about 400% CPU while the workers idled, and forcing custom plans removed the slowdown.")
+    for i, m in enumerate(modes):
+        ax.bar(i, med[m], width=0.5, color=color[m], zorder=3, linewidth=0)
+        n = len(drain[m])
+        ax.scatter([i + 0.36 + 0.07 * (k - (n - 1) / 2) for k in range(n)], sorted(drain[m]), s=26, color=SURFACE,
+                   edgecolor=INK2, linewidth=1.3, zorder=4, label="individual run" if i == 0 else None)
+        ax.text(i, max(drain[m]) + 3, f"{med[m]:.0f} s", ha="center", va="bottom", fontsize=11, fontweight="bold", color=INK)
+    ax.set_xticks([0, 1], ["before", "after"])
+    ax.set_ylabel("seconds to drain 60,000 jobs")
+    ax.set_ylim(0, max(max(v) for v in drain.values()) * 1.2)
+    ax.legend(frameon=False, loc="upper right", labelcolor=INK2, fontsize=9)
+    ax.set_title("Drain time", loc="left", fontsize=10, color=INK2, pad=6)
+    style_axis(ax)
+
+    by = defaultdict(dict)
+    for r in series:
+        by[(r["mode"], int(r["run"]))][int(r["t"])] = float(r["jobs_per_second"])
+    for m in modes:
+        for (mm, run), d in sorted(by.items()):
+            if mm != m:
+                continue
+            ts = sorted(d)
+            ax2.plot(ts, [d[t] for t in ts], color=color[m], linewidth=1.3, alpha=0.55, zorder=3,
+                     label=label[m] if run == 1 else None)
+    ax2.set_xlabel("seconds since the burst was inserted")
+    ax2.set_ylabel("jobs finished per second (all 4 workers)")
+    ax2.set_xlim(0, max(max(d) for d in by.values()))
+    ax2.set_ylim(bottom=0)
+    ax2.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:,.0f}"))
+    ax2.legend(frameon=False, loc="upper right", labelcolor=INK2, fontsize=9)
+    ax2.set_title("Throughput over time, one line per run (from the workers' own logs)", loc="left", fontsize=10, color=INK2, pad=6)
+    style_axis(ax2)
+    foot(fig, ENV + "  Source: docs/perf/data/cold-burst*.csv (scripts/perf-cold-burst.sh). Per-second counts are 'job finished' log lines.")
+    save(fig, "perf-cold-burst-plan-cache.png")
+
+
+def chart_notify():
+    lat = read_csv("notify-latency.csv")
+    idle = read_csv("notify-idle.csv")
+    sub = read_csv("notify-submit.csv")
+    modes = ["poll", "notify", "notify10s"]
+    label = {"poll": "poll (default)", "notify": "notify", "notify10s": "notify + 10 s fallback"}
+    color = {"poll": BLUE, "notify": ORANGE, "notify10s": AQUA}
+    workers = sorted({int(r["workers"]) for r in lat})
+    pick = defaultdict(list)
+    for r in lat:
+        pick[(r["mode"], int(r["workers"]))].append(float(r["pickup_ms"]))
+    med = {k: statistics.median(v) for k, v in pick.items()}
+    w0 = workers[0]
+    jobs_per_group = len(pick[("poll", w0)])
+    retry = read_csv("notify-retry.csv") if (DATA / "notify-retry.csv").exists() else []
+    fig, (ax, ax2, ax3, ax4) = plt.subplots(1, 4, figsize=(16.4, 5.4), gridspec_kw={"width_ratios": [1.6, 1.1, 0.8, 1.0]})
+    fig.subplots_adjust(left=0.05, right=0.99, top=0.74, bottom=0.2, wspace=0.42)
+    head(fig, "LISTEN/NOTIFY: idle jobs are picked up in milliseconds instead of waiting for the poll",
+         f"A job submitted to an idle fleet, {jobs_per_group} jobs per group at random phases against the 1 s poll. Median pickup "
+         f"{med[('poll', w0)]:.0f} ms with polling, {med[('notify', w0)]:.0f} ms with notifications ({w0} workers). Each dot is one job, "
+         "measured by the worker's own log line (database clock). The two panels on the right are the checks that could have "
+         "contradicted this: submit throughput, and the price of a long fallback poll for retried jobs.")
+    # 1: pickup latency, one strip per (workers, mode)
+    xs, ticks = 0, []
+    for w in workers:
+        for m in modes:
+            v = pick.get((m, w), [])
+            n = len(v)
+            ax.scatter([xs + 0.28 * ((k * 7919) % max(n, 1) / max(n, 1) - 0.5) for k in range(n)], v, s=16, color=color[m], alpha=0.75,
+                       linewidth=0, zorder=3, label=label[m] if w == workers[0] else None)
+            if v:
+                ax.hlines(med[(m, w)], xs - 0.22, xs + 0.22, color=INK, linewidth=2, zorder=4)
+                ax.text(xs, max(v) + 25, f"{med[(m, w)]:.0f} ms", ha="center", va="bottom", fontsize=9, fontweight="bold", color=INK)
+            ticks.append((xs, f"{label[m].split(' ')[0]}\n{w} workers" if m != "notify10s" else f"notify+10s\n{w} workers"))
+            xs += 1
+        xs += 0.6
+    ax.set_xticks([t[0] for t in ticks], [t[1] for t in ticks], fontsize=8)
+    ax.set_ylabel("pickup latency, ms (lower is better)")
+    ax.set_ylim(0, max(max(v) for v in pick.values()) * 1.18)
+    ax.legend(frameon=False, loc="upper right", labelcolor=INK2, fontsize=8.5)
+    ax.set_title("Pickup latency, idle fleet (bar = median)", loc="left", fontsize=10, color=INK2, pad=6)
+    style_axis(ax)
+    # 2: idle polling load
+    width = 0.26
+    for i, m in enumerate(modes):
+        for j, w in enumerate(workers):
+            rows = [float(r["empty_polls_per_s"]) for r in idle if r["mode"] == m and int(r["workers"]) == w]
+            if not rows:
+                continue
+            ax2.bar(j + (i - 1) * width, rows[0], width=width * 0.92, color=color[m], zorder=3, linewidth=0,
+                    label=label[m] if j == 0 else None)
+            ax2.text(j + (i - 1) * width, rows[0] + 0.05 * max(1, rows[0]), f"{rows[0]:.1f}", ha="center", va="bottom", fontsize=8.5, color=INK)
+    ax2.set_xticks(range(len(workers)), [f"{w} workers" for w in workers])
+    ax2.set_ylabel("empty claim polls per s (whole fleet)")
+    ax2.set_ylim(0, ax2.get_ylim()[1] * 1.12)
+    ax2.set_title("Idle load on the database", loc="left", fontsize=10, color=INK2, pad=6)
+    style_axis(ax2)
+    # 3: submit throughput
+    for i, m in enumerate(["poll", "notify"]):
+        v = [float(r["req_per_s"]) for r in sub if r["mode"] == m]
+        ax3.bar(i, statistics.median(v), width=0.5, color=color[m], zorder=3, linewidth=0)
+        ax3.scatter([i + 0.33 + 0.06 * (k - (len(v) - 1) / 2) for k in range(len(v))], v, s=24, color=SURFACE, edgecolor=INK2,
+                    linewidth=1.3, zorder=4, label="individual run" if i == 0 else None)
+        ax3.text(i, max(v) * 1.03, f"{statistics.median(v):,.0f}", ha="center", va="bottom", fontsize=10, fontweight="bold", color=INK)
+    ax3.set_xticks([0, 1], ["poll", "notify"])
+    ax3.set_ylabel("API submits per s")
+    ax3.set_ylim(0, max(float(r["req_per_s"]) for r in sub) * 1.2)
+    ax3.set_title("Submits/s (dots = 8 runs)", loc="left", fontsize=10, color=INK2, pad=6)
+    style_axis(ax3)
+    # 4: the cost side: retried jobs are not announced
+    rm = [m for m in modes if any(r["mode"] == m for r in retry)]
+    for i, m in enumerate(rm):
+        v = sorted(float(r["attempt2_late_ms"]) for r in retry if r["mode"] == m)
+        n = len(v)
+        ax4.scatter([i + 0.3 * (((k * 7919) % n) / n - 0.5) for k in range(n)], v, s=22, color=color[m], alpha=0.8, linewidth=0, zorder=3)
+        ax4.hlines(statistics.median(v), i - 0.22, i + 0.22, color=INK, linewidth=2, zorder=4)
+        ax4.text(i, max(v) + 150, f"max {max(v) / 1000:.1f} s" if max(v) >= 1000 else f"max {max(v):.0f} ms", ha="center", va="bottom", fontsize=8.5,
+                 fontweight="bold", color=INK)
+    if rm:
+        ax4.set_xticks(range(len(rm)), [label[m].replace(" + ", "+\n") if m == "notify10s" else label[m] for m in rm], fontsize=8)
+        ax4.set_ylabel("retried job: start delay, ms")
+        ax4.set_ylim(0, max(float(r["attempt2_late_ms"]) for r in retry) * 1.22)
+        ax4.set_title("Cost: late retries (bar = median)", loc="left", fontsize=10, color=INK2, pad=6)
+        style_axis(ax4)
+    else:
+        ax4.axis("off")
+    foot(fig, ENV + "  Source: docs/perf/data/notify-*.csv (scripts/perf-notify.sh). Idle polls: rate of jobscheduler_claim_polls_total{result=empty} over the last 60 s of an idle period.")
+    save(fig, "perf-notify-wakeups.png")
+
+
 if __name__ == "__main__":
     needed = ["scale.csv", "load.csv", "pool.csv", "chaos.csv", "chaos.summary.json", "burst.json", "burst.window"]
     missing = [n for n in needed if not (DATA / n).exists()]
@@ -343,3 +484,7 @@ if __name__ == "__main__":
     chart_burst()
     if (DATA / "batching.csv").exists():
         chart_batching()
+    if (DATA / "cold-burst.csv").exists():
+        chart_cold_burst()
+    if (DATA / "notify-latency.csv").exists():
+        chart_notify()

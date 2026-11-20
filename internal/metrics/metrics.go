@@ -39,6 +39,10 @@ type Metrics struct {
 	reaped       *prometheus.CounterVec
 	deleted      prometheus.Counter
 	batchSize    prometheus.Histogram
+	wakeups      *prometheus.CounterVec
+	claimPolls   *prometheus.CounterVec
+	listenerUp   prometheus.Gauge
+	notifySent   *prometheus.CounterVec
 	httpRequests *prometheus.CounterVec
 	httpDuration *prometheus.HistogramVec
 	submitted    *prometheus.CounterVec
@@ -68,6 +72,14 @@ func New() *Metrics {
 			"Finished jobs deleted by the retention sweeper."))),
 		batchSize: prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: ns, Name: "complete_batch_size",
 			Help: "Jobs recorded as succeeded per batched write (worker completion batching).", Buckets: []float64{1, 2, 5, 10, 20, 50, 100}}),
+		claimPolls: prometheus.NewCounterVec(prometheus.CounterOpts(f("claim_polls_total",
+			"Claim queries issued by workers. result=empty is idle polling: the load an idle worker puts on the database.")), []string{"queue", "result"}),
+		wakeups: prometheus.NewCounterVec(prometheus.CounterOpts(f("worker_wakeups_total",
+			"Idle-worker wake-ups caused by a notification. outcome=claimed found work; empty lost the race to another worker or was stale.")), []string{"outcome"}),
+		listenerUp: prometheus.NewGauge(prometheus.GaugeOpts(f("worker_notify_listener_up",
+			"1 while this worker's LISTEN connection is established (0: it is polling only)."))),
+		notifySent: prometheus.NewCounterVec(prometheus.CounterOpts(f("notifications_sent_total",
+			"Wake-up notifications published after jobs became runnable. result=error means a hint was lost; polling still finds the job.")), []string{"result"}),
 		httpRequests: prometheus.NewCounterVec(prometheus.CounterOpts(f("http_requests_total",
 			"HTTP requests.")), []string{"route", "method", "code"}),
 		httpDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: ns, Name: "http_request_duration_seconds",
@@ -90,7 +102,11 @@ func New() *Metrics {
 	m.reaped.WithLabelValues("dead")
 	m.schedFires.WithLabelValues("created")
 	m.schedFires.WithLabelValues("duplicate_prevented")
-	reg.MustRegister(m.rejected, m.schedFires, m.isLeader, m.claimed, m.pickup, m.duration, m.retries, m.reaped, m.deleted, m.batchSize,
+	m.wakeups.WithLabelValues("claimed")
+	m.wakeups.WithLabelValues("empty")
+	m.notifySent.WithLabelValues("ok")
+	m.notifySent.WithLabelValues("error")
+	reg.MustRegister(m.claimPolls, m.wakeups, m.listenerUp, m.notifySent, m.rejected, m.schedFires, m.isLeader, m.claimed, m.pickup, m.duration, m.retries, m.reaped, m.deleted, m.batchSize,
 		m.httpRequests, m.httpDuration, m.submitted)
 	return m
 }
@@ -124,9 +140,61 @@ func (o *workerObserver) Reaped(retried, dead int) {
 	o.m.reaped.WithLabelValues("dead").Add(float64(dead))
 }
 
+// Prime creates the worker's per-queue and per-type series at zero, at startup, for the queues it polls and the
+// job types it can run. A counter born at its first increment hides that increment from rate() and badly
+// under-reports the first seconds of a series' life: when a worker that had never claimed anything joined a
+// 60,000-job burst, Prometheus showed it at 41 to 60% of its peers for about 14 s although its logs show the same
+// rate from the second second. Only the series the throughput and claim panels read are primed (the "succeeded"
+// outcome), because priming every outcome would multiply the duration histogram's series by six per type.
+func (o *workerObserver) Prime(queues, types []string) {
+	for _, q := range queues {
+		o.m.claimed.WithLabelValues(q)
+		o.m.pickup.WithLabelValues(q)
+		o.m.claimPolls.WithLabelValues(q, "hit")
+		o.m.claimPolls.WithLabelValues(q, "empty")
+		for _, t := range types {
+			o.m.duration.WithLabelValues(q, t, "succeeded")
+		}
+	}
+}
+
 func (o *workerObserver) Deleted(n int) { o.m.deleted.Add(float64(n)) }
 
 func (o *workerObserver) CompleteBatch(n int) { o.m.batchSize.Observe(float64(n)) }
+
+func (o *workerObserver) ClaimPoll(q string, got int) {
+	if got > 0 {
+		o.m.claimPolls.WithLabelValues(q, "hit").Inc()
+	} else {
+		o.m.claimPolls.WithLabelValues(q, "empty").Inc()
+	}
+}
+
+func (o *workerObserver) Wakeup(claimed bool) {
+	if claimed {
+		o.m.wakeups.WithLabelValues("claimed").Inc()
+	} else {
+		o.m.wakeups.WithLabelValues("empty").Inc()
+	}
+}
+
+// ListenerUp is the callback for queue.Listener: 1 while the LISTEN connection is established.
+func (m *Metrics) ListenerUp(up bool) {
+	if up {
+		m.listenerUp.Set(1)
+	} else {
+		m.listenerUp.Set(0)
+	}
+}
+
+// NotifySent is the callback for queue.Notifier: the outcome of one published notification.
+func (m *Metrics) NotifySent(ok bool) {
+	if ok {
+		m.notifySent.WithLabelValues("ok").Inc()
+	} else {
+		m.notifySent.WithLabelValues("error").Inc()
+	}
+}
 
 // APIObserver adapts Metrics to api.Observer.
 func (m *Metrics) APIObserver() *apiObserver { return &apiObserver{m} }

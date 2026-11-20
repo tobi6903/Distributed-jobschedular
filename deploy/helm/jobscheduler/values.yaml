@@ -50,6 +50,17 @@ api:
     annotations: {}
     tls: []
 
+# Wake-up notifications (Postgres LISTEN/NOTIFY). Off by default. When on, the API and scheduler publish a hint
+# when a job becomes runnable and each worker holds one extra, dedicated database connection that LISTENs, so an
+# idle worker claims in milliseconds instead of at its next poll. The poll stays as the safety net, so a lost
+# notification never loses a job. The LISTEN connection must reach Postgres directly or through a session-mode
+# pooler: a transaction-mode PgBouncer silently drops notifications. See docs/OPERATIONS.md "Wake-up notifications".
+notify:
+  enabled: false
+  window: 25ms                 # at most one notification per queue per window (NOTIFY serializes commits)
+  workerFallbackPoll: ""       # idle poll interval while a worker is listening, e.g. 10s. Empty = same as the poll interval.
+                               # Raising it cuts idle queries but delays retried and scheduled jobs, which nothing announces.
+
 worker:
   replicas: 2                  # ignored when keda.enabled (KEDA owns the replica count)
   maxConns: 20                 # claims are batched, but every finished job needs a connection to record it

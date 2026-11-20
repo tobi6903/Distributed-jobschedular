@@ -6,7 +6,8 @@
 source "$(dirname "$0")/lib-compose.sh"
 FAILED=0
 wait_ready
-KEY=$(mint_key smoke); export KEY
+TENANT="smoke-$(date +%s)"
+KEY=$(mint_key "$TENANT"); export KEY
 
 # 1. A job that fails twice then succeeds: exercises API -> Postgres -> worker -> retry/backoff.
 ID=$(api POST /jobs '{"type":"flaky","payload":{"succeed_on_attempt":3}}' | jget "d['id']")
@@ -15,9 +16,12 @@ ATT=$(api GET /jobs/$ID | jget "d['attempts']")
 [ "$ST" = succeeded ] && [ "$ATT" = 3 ] && pass "retrying job succeeded on attempt 3" || fail "flaky job: status=$ST attempts=$ATT"
 
 # 2. Cron: a every-2s schedule must create jobs, with unique per-slot keys.
-api POST /schedules '{"name":"smoke-cron","cron_expr":"@every 2s","misfire_policy":"fire_all","type":"noop"}' >/dev/null
+# Each run uses its own tenant (a fresh key above) and deletes the schedule afterwards: schedule names are
+# unique per tenant, so a leftover would make the next run fail with 409, and it would fire every 2s forever.
+SCHED=$(api POST /schedules '{"name":"smoke-cron","cron_expr":"@every 2s","misfire_policy":"fire_all","type":"noop"}' | jget "d['id']")
+trap 'api DELETE /schedules/$SCHED >/dev/null 2>&1 || true' EXIT
 sleep 12
-N=$(psql_ -c "select count(*)||' '||count(distinct idempotency_key) from jobs where idempotency_key like 'cron:%'")
+N=$(psql_ -c "select count(*)||' '||count(distinct idempotency_key) from jobs where tenant_id='$TENANT' and idempotency_key like 'cron:%'")
 set -- $N
 [ "$1" -ge 3 ] && [ "$1" = "$2" ] && pass "cron fired $1 slots, all distinct" || fail "cron slots: total=$1 distinct=$2"
 

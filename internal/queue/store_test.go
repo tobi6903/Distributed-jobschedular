@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -29,6 +30,37 @@ func mustEnqueue(t *testing.T, s *queue.Store, n job.NewJob) job.Job {
 		t.Fatalf("enqueue: %v", err)
 	}
 	return j
+}
+
+// Pooled connections plan every statement with its real parameters. A cached generic plan built while the jobs table
+// was empty made a 60,000-job burst run 2.5x slower on freshly started workers (see pool.go).
+func TestConnectForcesCustomPlans(t *testing.T) {
+	ctx := context.Background()
+	dsn := testdb.New(t, 2).Config().ConnString()
+
+	pool, err := queue.Connect(ctx, dsn, 2, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	var mode string
+	if err := pool.QueryRow(ctx, `SHOW plan_cache_mode`).Scan(&mode); err != nil || mode != "force_custom_plan" {
+		t.Fatalf("plan_cache_mode = %q (%v), want force_custom_plan", mode, err)
+	}
+
+	// An operator who chose a mode in the connection string keeps it.
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	pool2, err := queue.Connect(ctx, dsn+sep+"plan_cache_mode=auto", 2, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool2.Close()
+	if err := pool2.QueryRow(ctx, `SHOW plan_cache_mode`).Scan(&mode); err != nil || mode != "auto" {
+		t.Fatalf("an explicit plan_cache_mode must be respected: got %q (%v)", mode, err)
+	}
 }
 
 func TestEnqueueDefaultsAndGet(t *testing.T) {

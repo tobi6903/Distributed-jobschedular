@@ -31,6 +31,9 @@ All configuration is environment variables, validated at startup (all errors rep
 | `WORKER_REAP_INTERVAL` | 10s | How often expired leases are recovered |
 | `WORKER_COMPLETE_BATCH` | false | Group "succeeded" writes into one commit (group commit). See [Completion batching](#completion-batching) |
 | `WORKER_COMPLETE_BATCH_LINGER` / `_MAX` | 0 / = concurrency | Optional extra wait to fill a batch (leave at 0) / most results per statement |
+| `WORKER_NOTIFY` | false | `LISTEN` for wake-up notifications: an idle worker claims in milliseconds instead of at its next poll. Costs one extra dedicated connection per worker. See [Wake-up notifications](#wake-up-notifications) |
+| `WORKER_NOTIFY_FALLBACK_POLL` | 0 (= `WORKER_POLL_INTERVAL`) | Idle poll interval while the worker is listening. Raising it cuts idle queries but delays retried and scheduled jobs |
+| `NOTIFY` / `NOTIFY_WINDOW` | false / 25ms | API and scheduler: publish a notification when a job becomes runnable, at most one per queue per window |
 | `RETENTION` | 168h | Finished jobs are deleted after this (also the idempotency-key dedup window) |
 | `BACKOFF_BASE` / `BACKOFF_CAP` | 5s / 1h | Retry delay: `min(cap, base*2^(n-1))` with equal jitter |
 | `SCHEDULER_TICK` | 1s | How often the leader looks for due schedules |
@@ -46,7 +49,7 @@ All configuration is environment variables, validated at startup (all errors rep
 ### Database connections: the first thing to budget
 
 ```
-total connections = (api pods + worker pods + scheduler pods) x their DB_MAX_CONNS  +  1 per scheduler (election session)
+total connections = (api pods + worker pods + scheduler pods) x their DB_MAX_CONNS  +  1 per scheduler (election session)  +  1 per worker if WORKER_NOTIFY (its LISTEN session)
 ```
 
 This must stay under Postgres `max_connections` (minus headroom for migrations, `psql`, monitoring). The shipped defaults are **per component** (Compose and the Helm chart): API 40, worker 20, scheduler 5 (the process default, for anything else, is 10). With 2 API pods, 2 workers and 2 schedulers that is 80 + 40 + 12 = 132 connections, within the Compose Postgres's `max_connections=200`. With 40 workers and 10 API pods it is 1,200: above any default Postgres. Options, in order of preference: lower the pool sizes (but see the next paragraph before cutting them), raise `max_connections` with enough RAM, or put **PgBouncer in transaction mode** in front of the API and workers. **Never put the scheduler behind a transaction-mode pooler**: its advisory-lock leader election needs a real session.
@@ -89,6 +92,33 @@ Handlers are usually I/O bound, so `WORKER_CONCURRENCY` can be much higher than 
 
 **What it does not do.** Commits per job fell by 3.5x at 8 workers but throughput rose by 1.5x, not 3.5x: the remaining cost is the row updates, WAL volume and a host shared by every container. So commit rate was *a* limit, not the only one. Do not set `WORKER_COMPLETE_BATCH_LINGER`: a fixed 5 ms wait cost throughput at 1 and 2 workers (958 vs 1,156 and 1,595 vs 2,015 jobs/s) for no gain over plain group commit. The batch size is observable as `jobscheduler_complete_batch_size`.
 
+### Wake-up notifications
+
+`WORKER_NOTIFY=true` on workers and `NOTIFY=true` on the API and scheduler (Helm: `notify.enabled`, which sets all three) make an idle worker claim a new job in milliseconds instead of waiting for its next poll. It is **off by default**: it costs one extra connection per worker and only matters when pickup latency matters.
+
+**What it does.** The API and scheduler send a Postgres `NOTIFY` after a job that is runnable now has committed (at most one per queue per `NOTIFY_WINDOW`, 25 ms, because `NOTIFY` serializes commits). Each worker holds a dedicated `LISTEN` connection and, on a hint, claims immediately with the usual `SKIP LOCKED` query. A hint only ends an idle sleep early, so losing one never loses a job: the poll still runs. Design and failure model: [DESIGN.md section 21](DESIGN.md#21-wake-up-notifications-listennotify).
+
+**What it buys (measured, one shared machine).** For a job submitted to an idle fleet, median pickup 377 ms to 9 ms with 2 workers; with 8 workers polling on independent timers the baseline is already 69 ms and the median goes to 7 ms (p95 273 ms to 9 ms). The gain is largest for small fleets and the tail.
+
+**What it does not do.**
+- **It does not cut idle load by itself.** Empty polls per second were unchanged (8.0 at 8 workers). Only raising `WORKER_NOTIFY_FALLBACK_POLL` cuts them (0.8 at a 10 s fallback), and that has a price:
+- **Retried and scheduled jobs are not announced.** They become runnable at a future time and are found by the poll. With a 10 s fallback a retried job started up to 8.9 s late in the measurement (3 of 12 were over 7 s late). Leave `WORKER_NOTIFY_FALLBACK_POLL` unset unless idle query volume is a real problem and your retry backoff is long compared with the fallback.
+- **Many workers wake for one job.** About 7 of 8 woken workers find nothing (`jobscheduler_worker_wakeups_total{outcome="empty"}` against `claimed`). Each costs one indexed query; it is not a correctness issue.
+- **Submit throughput:** no difference was detectable (median 1,548 vs 1,500 req/s over 8 pairs, p99 113 vs 114 ms), but the run-to-run noise was about +/-30%, so a small cost is not excluded.
+
+**Rollout order.** Workers first (a listener with no publisher is harmless and just keeps polling), then the API and scheduler. Roll back in the opposite order, or just turn all three off: nothing else changes.
+
+**Constraints.**
+- The `LISTEN` connection must reach Postgres **directly or through a session-mode pooler**. A transaction-mode PgBouncer does not deliver notifications, and the worker still looks healthy. If you use one, leave the fallback poll alone, because the poll is then the only mechanism.
+- Budget one more connection per worker (see "Database connections" above).
+- Reconnection after a lost connection is automatic (backoff 1 s to 30 s); a signal is sent after each reconnect.
+
+**Watching it.** `jobscheduler_worker_notify_listener_up` is 1 while a worker is listening (a worker at 0 is polling only); `jobscheduler_notifications_sent_total{result="error"}` counts hints that could not be sent; `jobscheduler_claim_polls_total{result="empty"}` is the idle polling load; `jobscheduler_worker_wakeups_total` shows the herd. If notifications silently stop (a pooler change, a network policy), pickup latency returns to the poll interval, so `job_pickup_latency_seconds` is where it shows up.
+
+### Plan cache mode (a trap for fresh workers)
+
+Every pooled connection runs with `plan_cache_mode=force_custom_plan` (set in [pool.go](../internal/queue/pool.go); a `plan_cache_mode` in `DATABASE_URL` wins). Without it, a worker that had been idling against an empty `jobs` table could cache a generic plan that was catastrophic once a burst arrived: measured, a 60,000-job burst took a median of 61 s instead of 29 s on freshly started workers, with Postgres at about 400% CPU and the workers idle. **Symptom to recognise:** after a deploy or scale-out, a burst drains slowly for 30 to 60 s while `pg_stat_activity` shows a few active backends and Postgres CPU is high but worker CPU is not; it ends abruptly (when autovacuum next analyzes `jobs`). Cost of the fix: statements are planned on every execution. At the measured scale that is not visible (the fixed runs match the warm baseline), and `jobs` statements are simple. Other tools you point at the same database are unaffected. See [DESIGN.md section 20](DESIGN.md#20-the-cached-plan-trap-found-by-investigating-uneven-burst-claims).
+
 ### Lease length
 
 Longer leases mean slower crash recovery (a dead worker's jobs wait up to lease + reap interval); shorter leases mean more heartbeat traffic and more false reclaims under GC pauses or CPU throttling. 30s is a sane default. Keep `heartbeat <= lease/3` (enforced at startup).
@@ -101,7 +131,7 @@ In the order you will hit them as load grows. The measured numbers come from the
 2. **Dead tuples and vacuum.** Every job produces about 3 row versions, plus one per heartbeat. `status` and `locked_until` are in index predicates or keys, so these updates are not HOT. If autovacuum falls behind, the partial claim index fills with dead entries and claim latency climbs. Migration `000006` already makes autovacuum aggressive on `jobs`. Watch `n_dead_tup` and `last_autovacuum`; keep `RETENTION` short. This is the failure that looks like "the queue got slow for no reason".
 3. **Connections** (see sizing). Symptoms: `too many clients`, API 503s, workers logging `claim failed`.
 4. **Claim contention.** `SKIP LOCKED` avoids blocking, but every worker scans the head of the same index. Batch claiming amortises round trips. At very high worker counts, split queues (each queue has its own index range) or tenants across databases.
-5. **Poll latency vs idle load.** Pickup latency when idle is up to `WORKER_POLL_INTERVAL`. Lowering it raises idle query load (workers x 1/interval). `LISTEN/NOTIFY` as a wake-up hint (polling stays the source of truth) is the standard fix and a natural next step.
+5. **Poll latency vs idle load.** Pickup latency when idle is up to `WORKER_POLL_INTERVAL`. Lowering it raises idle query load (workers x 1/interval). `WORKER_NOTIFY` (see [Wake-up notifications](#wake-up-notifications)) removes most of the idle latency without polling faster, at the cost of one connection per worker.
 6. **Strict priority starvation.** Higher priority always runs first, so a steady stream of high-priority jobs starves low-priority ones. Priority aging is not implemented.
 7. **Table size.** Retention keeps it bounded. If you need long retention, partition by `finished_at` (note the cost: unique idempotency keys across partitions, and `SKIP LOCKED` on a partitioned table needs care).
 
@@ -167,7 +197,9 @@ API keys are 256-bit random values stored as SHA-256 hashes; the plaintext is sh
 Found by looking at real dashboards during chaos runs:
 
 - **Create fixed-label counters at zero.** `rate()` and `increase()` cannot see the jump from "series does not exist" to its first value. A counter born at its first increment hides that first event: this once made the first crash recovery on every worker invisible, so `WorkerCrashesDetected` would have missed it. `metrics.New()` now pre-creates `jobs_reaped_total` and `scheduler_fires_total`. Counters with **dynamic labels** (retries per job type, rejections per queue) cannot be pre-created; alert on sustained rates, never on a single event.
+- **A new series is under-reported in its first window.** The same mechanism: a series that appears at its first increment hides it from `rate()`, and a 20 s window takes 20 s to fill. Workers now pre-create `jobs_claimed_total`, the pickup histogram and the `succeeded` duration series for their queues and job types at startup (`metrics.workerObserver.Prime`). The other outcomes stay lazy to keep cardinality down, so the first failure of each type on each worker is still invisible to `rate()`.
 - **Scrape-based metrics are blind in a crash storm.** A container that lives less than one scrape interval is never scraped, so worker-side counters under-report while containers are killed every few seconds. The Compose stack scrapes the app targets every 5 s; production at 15 to 30 s is fine for normal crashes.
+- **`claim_polls_total` counts queries, not jobs.** An idle worker contributes `result="empty"` polls even with nothing to do; that is the point (it is the idle load). With notifications on, a hint-triggered wake-up that loses the race is also an empty poll, so the empty-poll rate can exceed `workers / poll interval` during bursts of announced jobs.
 - **Histogram quantiles above the top finite bucket are interpolated.** The pickup-latency buckets end at 30, 60 and 300 s, so a 47 s wait shows as a "60 s p99". The SLO is defined at 30 s, where the buckets are exact; use `oldest_ready_job_age_seconds` for long waits.
 - **Database-derived gauges are sampled coarsely.** `queue_depth` and `oldest_ready_job_age_seconds` come from the scheduler leader's collector (cached 5 s) and are scraped every 5 s, so they appear in steps about 10 s wide.
 

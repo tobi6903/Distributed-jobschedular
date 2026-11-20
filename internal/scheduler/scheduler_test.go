@@ -402,3 +402,72 @@ func TestTwoReplicasFireEachSlotOnce(t *testing.T) {
 		t.Fatalf("jobs=%d distinct=%d, want 3..6 and all distinct", total, distinct)
 	}
 }
+
+// FireDue reports which queues received new jobs, once each, so the scheduler can wake idle workers after the
+// transaction commits. A fire blocked by the idempotency key created nothing, so it names no queue.
+func TestFireResultNamesEachQueueThatReceivedJobs(t *testing.T) {
+	ctx := context.Background()
+	s, pool := newStore(t)
+	for i, q := range []string{"reports", "emails", "reports"} {
+		n := newSched(fmt.Sprintf("s%d", i))
+		n.Queue = q
+		if _, err := s.Create(ctx, n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, _ = pool.Exec(ctx, `UPDATE schedules SET next_fire_at = now() - interval '10 seconds'`)
+	res, err := s.FireDue(ctx, fireCfg())
+	if err != nil || res.Fired != 3 {
+		t.Fatalf("fire: %+v %v", res, err)
+	}
+	got := map[string]int{}
+	for _, q := range res.Queues {
+		got[q]++
+	}
+	if len(res.Queues) != 2 || got["reports"] != 1 || got["emails"] != 1 {
+		t.Fatalf("Queues = %v, want reports and emails once each", res.Queues)
+	}
+
+	// Rewind: the same slots are blocked by their idempotency keys, so nothing new and no queue to announce.
+	_, _ = pool.Exec(ctx, `UPDATE schedules SET next_fire_at = now() - interval '10 seconds'`)
+	res, err = s.FireDue(ctx, fireCfg())
+	if err != nil || res.Fired != 0 || len(res.Queues) != 0 {
+		t.Fatalf("re-fire of blocked slots: %+v %v, want no queues", res, err)
+	}
+}
+
+type notifyRec struct {
+	mu sync.Mutex
+	qs []string
+}
+
+func (n *notifyRec) Notify(q string) { n.mu.Lock(); n.qs = append(n.qs, q); n.mu.Unlock() }
+func (n *notifyRec) got() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([]string(nil), n.qs...)
+}
+
+// The running scheduler announces the queues it created jobs in.
+func TestSchedulerNotifiesQueuesItFiredInto(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, pool := newStore(t)
+	n := newSched("now")
+	n.Queue = "reports"
+	if _, err := s.Create(ctx, n); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = pool.Exec(ctx, `UPDATE schedules SET next_fire_at = now() - interval '5 seconds'`)
+
+	rec := &notifyRec{}
+	sch := scheduler.New(s, scheduler.Config{Tick: 50 * time.Millisecond, DisableLock: true}, quiet(), scheduler.WithNotifier(rec))
+	done := make(chan struct{})
+	go func() { sch.Run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+
+	eventually(t, 5*time.Second, "a notification for the fired queue", func() bool { return len(rec.got()) > 0 })
+	if got := rec.got(); got[0] != "reports" {
+		t.Fatalf("notified %v, want reports", got)
+	}
+}
