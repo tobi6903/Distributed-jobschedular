@@ -1,6 +1,6 @@
 # Production overrides. CI updates image.tag on every merge to main.
 image:
-  tag: "sha-a2a46a11bd5d4768d2653579dcccb8c1f2070a46"
+  tag: "sha-ab04469f2438c0d56fcdb3d618cb5ea28d0d405f"
 
 database:
   # Synced from your secret store (External Secrets Operator, Sealed Secrets, ...). The chart
