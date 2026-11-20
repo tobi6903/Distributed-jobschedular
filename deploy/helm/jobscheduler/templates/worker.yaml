@@ -67,6 +67,12 @@ spec:
               value: {{ printf "%ds" (int .Values.worker.maxJobTimeoutSeconds) | quote }}
             - name: WORKER_COMPLETE_BATCH
               value: {{ .Values.worker.completeBatch | quote }}
+            - name: WORKER_NOTIFY
+              value: {{ .Values.notify.enabled | quote }}
+            {{- if .Values.notify.workerFallbackPoll }}
+            - name: WORKER_NOTIFY_FALLBACK_POLL
+              value: {{ .Values.notify.workerFallbackPoll | quote }}
+            {{- end }}
             - name: RETENTION
               value: {{ .Values.worker.retention | quote }}
             - name: BACKOFF_BASE

@@ -48,13 +48,20 @@ func run() error {
 
 	m := metrics.New()
 	store := queue.New(pool)
+	opts := []scheduler.Option{scheduler.WithObserver(m.SchedulerObserver())}
+	if cfg.Notify {
+		n := queue.NewNotifier(pool, cfg.NotifyWindow, m.NotifySent)
+		defer n.Close() // runs before pool.Close (LIFO)
+		opts = append(opts, scheduler.WithNotifier(n))
+		log.Info("wake-up notifications enabled", "window", cfg.NotifyWindow.String())
+	}
 	sch := scheduler.New(scheduler.NewStore(pool), scheduler.Config{
 		DSN:         cfg.DatabaseURL, // the elector opens its own dedicated session connection
 		Tick:        cfg.Tick,
 		RetryElect:  cfg.RetryElect,
 		Grace:       cfg.DefaultGrace,
 		DisableLock: cfg.DisableLock,
-	}, log, scheduler.WithObserver(m.SchedulerObserver()))
+	}, log, opts...)
 
 	// Queue-depth gauges are exported only by the current leader, so Prometheus sees one
 	// series per queue rather than one per replica.

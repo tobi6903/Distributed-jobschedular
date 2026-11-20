@@ -361,6 +361,31 @@ func TestWorkerCompleteBatchToggle(t *testing.T) {
 	}
 }
 
+// Wake-up notifications are off by default everywhere, and one switch turns on the publishers (API, scheduler)
+// and the listeners (workers) together: enabling only one side would be a silent no-op.
+func TestNotifyToggle(t *testing.T) {
+	envs := func(docs []obj) (api, sch, wrk map[string]string) {
+		return envOf(containerOf(find(docs, "Deployment", "-api"))),
+			envOf(containerOf(find(docs, "Deployment", "-scheduler"))),
+			envOf(containerOf(find(docs, "Deployment", "-worker")))
+	}
+	api, sch, wrk := envs(mustRender(t, base))
+	if api["NOTIFY"] != "false" || sch["NOTIFY"] != "false" || wrk["WORKER_NOTIFY"] != "false" {
+		t.Errorf("notify must default off: api=%q scheduler=%q worker=%q", api["NOTIFY"], sch["NOTIFY"], wrk["WORKER_NOTIFY"])
+	}
+	if _, set := wrk["WORKER_NOTIFY_FALLBACK_POLL"]; set {
+		t.Error("the fallback poll must not be set unless configured")
+	}
+	api, sch, wrk = envs(mustRender(t, obj{"database": obj{"existingSecret": "x"},
+		"notify": obj{"enabled": true, "window": "50ms", "workerFallbackPoll": "10s"}}))
+	if api["NOTIFY"] != "true" || sch["NOTIFY"] != "true" || wrk["WORKER_NOTIFY"] != "true" {
+		t.Errorf("one switch must enable all three: api=%q scheduler=%q worker=%q", api["NOTIFY"], sch["NOTIFY"], wrk["WORKER_NOTIFY"])
+	}
+	if api["NOTIFY_WINDOW"] != "50ms" || sch["NOTIFY_WINDOW"] != "50ms" || wrk["WORKER_NOTIFY_FALLBACK_POLL"] != "10s" {
+		t.Errorf("window/fallback not passed through: %q %q %q", api["NOTIFY_WINDOW"], sch["NOTIFY_WINDOW"], wrk["WORKER_NOTIFY_FALLBACK_POLL"])
+	}
+}
+
 // The shutdown contract: Kubernetes must give a worker longer than it takes to drain.
 func TestWorkerTerminationGraceMatchesJobTimeout(t *testing.T) {
 	for _, timeout := range []int{60, 300, 3600} {

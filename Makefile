@@ -19,7 +19,7 @@ API_URL   ?= http://localhost:8080
 # have Docker running so testcontainers can start one. `make test-db` starts a local container.
 TEST_DATABASE_URL ?=
 
-.PHONY: help build test test-short lint fmt vet tidy test-db up down logs ps key demo migrate \
+.PHONY: hpa-verify help build test test-short lint fmt vet tidy test-db up down logs ps key demo migrate \
         load-test bench chaos chaos-docker smoke kind-up k8s-verify argocd-verify kind-down docker-build helm-lint k8s-validate rules-test validate dev-up dev-down clean
 
 help: ## list targets
@@ -98,6 +98,9 @@ kind-up: ## kind cluster + KEDA + metrics-server + the chart (needs `make docker
 
 k8s-verify: ## verify KEDA, crashes, rolling deploys, node drains and NetworkPolicies on the kind cluster (FULL=1 adds a 2.5 min test)
 	./scripts/k8s-verify.sh
+
+hpa-verify: ## push in-cluster load through the Service and check the API HPA scales out and spreads load (run on a fresh kind-up)
+	./scripts/hpa-verify.sh
 
 argocd-verify: ## GitOps check: Argo CD deploys the chart, heals drift, rolls out and rolls back
 	./scripts/argocd-verify.sh

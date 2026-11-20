@@ -1,0 +1,9 @@
+mode,run,drain_seconds,first_1000_per_s_at,worker_min,worker_max
+auto,1,21,2,14761,15198
+custom,1,23,2,14731,15566
+auto,2,57,3,13695,17119
+custom,2,33,4,14585,15893
+auto,3,65,19,12973,20782
+custom,3,31,2,14690,15305
+auto,4,78,48,12967,18154
+custom,4,27,2,14716,15733

@@ -64,6 +64,30 @@ func TestWorkerObserver(t *testing.T) {
 	}
 }
 
+// Series the worker will use are created at zero at startup, so rate() sees the very first claims instead of
+// missing everything before the first scrape.
+func TestPrimeCreatesWorkerSeriesAtZero(t *testing.T) {
+	m := New()
+	m.WorkerObserver().Prime([]string{"default", "emails"}, []string{"noop", "sleep"})
+	if n := testutil.CollectAndCount(m.claimed); n != 2 {
+		t.Errorf("claimed series = %d, want one per queue (2)", n)
+	}
+	if n := testutil.CollectAndCount(m.claimPolls); n != 4 {
+		t.Errorf("claim_polls series = %d, want hit and empty per queue (4)", n)
+	}
+	if n := testutil.CollectAndCount(m.duration); n != 4 {
+		t.Errorf("duration series = %d, want queue x type, succeeded only (4)", n)
+	}
+	if got := testutil.ToFloat64(m.claimed.WithLabelValues("emails")); got != 0 {
+		t.Errorf("primed counter = %v, want 0", got)
+	}
+	// Unprimed outcomes stay lazy: priming must not multiply cardinality by every outcome.
+	m.WorkerObserver().Finished("default", "noop", "dead", time.Second)
+	if n := testutil.CollectAndCount(m.duration); n != 5 {
+		t.Errorf("duration series after one dead job = %d, want 5", n)
+	}
+}
+
 func TestCompleteBatchSizeHistogram(t *testing.T) {
 	m := New()
 	o := m.WorkerObserver()
@@ -197,5 +221,45 @@ func TestFixedLabelCountersExistAtZero(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(m.reaped.WithLabelValues("retried")); got != 0 {
 		t.Fatalf("starts at %v, want 0", got)
+	}
+}
+
+// The notify series exist at zero before anything happens, and the listener gauge follows the connection.
+func TestNotifyMetrics(t *testing.T) {
+	m := New()
+	m.WorkerObserver().ClaimPoll("default", 0)
+	m.WorkerObserver().ClaimPoll("default", 0)
+	m.WorkerObserver().ClaimPoll("default", 3)
+	if testutil.ToFloat64(m.claimPolls.WithLabelValues("default", "empty")) != 2 || testutil.ToFloat64(m.claimPolls.WithLabelValues("default", "hit")) != 1 {
+		t.Fatal("claim polls miscounted: want 2 empty, 1 hit")
+	}
+	if n := testutil.CollectAndCount(m.wakeups); n != 2 {
+		t.Fatalf("wakeups series = %d, want claimed and empty at 0", n)
+	}
+	if n := testutil.CollectAndCount(m.notifySent); n != 2 {
+		t.Fatalf("notifications_sent series = %d, want ok and error at 0", n)
+	}
+	o := m.WorkerObserver()
+	o.Wakeup(true)
+	o.Wakeup(false)
+	o.Wakeup(false)
+	if got := testutil.ToFloat64(m.wakeups.WithLabelValues("empty")); got != 2 {
+		t.Fatalf("empty wakeups = %v, want 2", got)
+	}
+	if got := testutil.ToFloat64(m.wakeups.WithLabelValues("claimed")); got != 1 {
+		t.Fatalf("claimed wakeups = %v, want 1", got)
+	}
+	m.ListenerUp(true)
+	if testutil.ToFloat64(m.listenerUp) != 1 {
+		t.Fatal("listener gauge should be 1 while connected")
+	}
+	m.ListenerUp(false)
+	if testutil.ToFloat64(m.listenerUp) != 0 {
+		t.Fatal("listener gauge should be 0 when disconnected")
+	}
+	m.NotifySent(true)
+	m.NotifySent(false)
+	if testutil.ToFloat64(m.notifySent.WithLabelValues("ok")) != 1 || testutil.ToFloat64(m.notifySent.WithLabelValues("error")) != 1 {
+		t.Fatal("notification outcomes miscounted")
 	}
 }

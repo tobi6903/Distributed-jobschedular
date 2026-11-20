@@ -24,6 +24,8 @@ type API struct {
 	Addr            string
 	ShutdownDelay   time.Duration // time to stay unready before closing listeners (LB drain)
 	ShutdownTimeout time.Duration
+	Notify          bool          // publish a wake-up notification when a job becomes runnable
+	NotifyWindow    time.Duration // at most one notification per queue per window
 }
 
 type Worker struct {
@@ -44,6 +46,9 @@ type Worker struct {
 	CompleteBatch       bool          // group commit of success writes
 	CompleteBatchLinger time.Duration // optional extra wait to fill a batch (0 = none)
 	CompleteBatchMax    int           // 0 = Concurrency
+
+	Notify             bool          // LISTEN for wake-up notifications: idle workers claim at once instead of at the next poll
+	NotifyFallbackPoll time.Duration // idle poll interval while the listener is up (0 = PollInterval)
 }
 
 type Scheduler struct {
@@ -52,6 +57,8 @@ type Scheduler struct {
 	RetryElect   time.Duration // how often a standby retries leader election
 	DisableLock  bool          // test-only: skip leader election to prove the idempotent-key backstop
 	DefaultGrace time.Duration
+	Notify       bool          // publish a wake-up notification when a cron fire creates jobs
+	NotifyWindow time.Duration // at most one notification per queue per window
 }
 
 // loader accumulates parse errors so the caller sees every problem at once.
@@ -159,6 +166,8 @@ func LoadAPI(getenv func(string) string) (API, error) {
 		Addr:            l.str("HTTP_ADDR", ":8080"),
 		ShutdownDelay:   l.dur("SHUTDOWN_DELAY", 5*time.Second),
 		ShutdownTimeout: l.dur("SHUTDOWN_TIMEOUT", 20*time.Second),
+		Notify:          l.boolean("NOTIFY", false),
+		NotifyWindow:    l.dur("NOTIFY_WINDOW", 25*time.Millisecond),
 	}
 	return c, l.err()
 }
@@ -180,6 +189,8 @@ func LoadWorker(getenv func(string) string) (Worker, error) {
 		CompleteBatch:       l.boolean("WORKER_COMPLETE_BATCH", false),
 		CompleteBatchLinger: l.dur("WORKER_COMPLETE_BATCH_LINGER", 0),
 		CompleteBatchMax:    l.integer("WORKER_COMPLETE_BATCH_MAX", 0),
+		Notify:              l.boolean("WORKER_NOTIFY", false),
+		NotifyFallbackPoll:  l.dur("WORKER_NOTIFY_FALLBACK_POLL", 0),
 		Retention:           l.dur("RETENTION", 7*24*time.Hour),
 		BackoffBase:         l.dur("BACKOFF_BASE", 5*time.Second),
 		BackoffCap:          l.dur("BACKOFF_CAP", time.Hour),
@@ -189,6 +200,9 @@ func LoadWorker(getenv func(string) string) (Worker, error) {
 	}
 	if c.Lease <= 0 {
 		l.errs = append(l.errs, errors.New("WORKER_LEASE must be > 0"))
+	}
+	if c.NotifyFallbackPoll < 0 {
+		l.errs = append(l.errs, errors.New("WORKER_NOTIFY_FALLBACK_POLL must be >= 0"))
 	}
 	hb := c.HeartbeatInterval
 	if hb == 0 {
@@ -209,6 +223,8 @@ func LoadScheduler(getenv func(string) string) (Scheduler, error) {
 		Tick:         l.dur("SCHEDULER_TICK", time.Second),
 		RetryElect:   l.dur("SCHEDULER_ELECTION_RETRY", 5*time.Second),
 		DefaultGrace: l.dur("SCHEDULER_MISFIRE_GRACE", time.Minute),
+		Notify:       l.boolean("NOTIFY", false),
+		NotifyWindow: l.dur("NOTIFY_WINDOW", 25*time.Millisecond),
 	}
 	return c, l.err()
 }

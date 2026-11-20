@@ -13,6 +13,7 @@ DATABASE_URL=postgres://... ./bin/scheduler    # point it at Postgres directly, 
 | `SCHEDULER_TICK` | 1s | how often the leader looks for due schedules |
 | `SCHEDULER_ELECTION_RETRY` | 5s | how often a standby retries (about the worst-case cron failover time) |
 | `SCHEDULER_MISFIRE_GRACE` | 1m | how stale a slot may be and still fire under the `skip` policy |
+| `NOTIFY` / `NOTIFY_WINDOW` | false / 25ms | wake idle workers when a cron fire creates jobs (see [Wake-up notifications](../../docs/OPERATIONS.md#wake-up-notifications)) |
 | `METRICS_ADDR` | `:9101` | `/metrics` and `/healthz` |
 | `DB_MAX_CONNS` | 10 (Compose/Helm: 5) | plus one dedicated connection for the election |
 

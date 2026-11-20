@@ -55,7 +55,17 @@ func run() error {
 	}
 
 	m := metrics.New()
+	var wake worker.WakeSource
+	if cfg.Notify {
+		// A dedicated connection, not the pool: LISTEN is session state. It must reach Postgres directly or
+		// through a session-mode pooler (a transaction-mode PgBouncer drops notifications).
+		l := queue.NewListener(cfg.DatabaseURL, cfg.Queues, log, m.ListenerUp)
+		go l.Run(ctx)
+		wake = l
+	}
 	w := worker.New(queue.New(pool), reg, worker.Config{
+		Wake:                wake,
+		FallbackPoll:        cfg.NotifyFallbackPoll,
 		Queues:              cfg.Queues,
 		Concurrency:         cfg.Concurrency,
 		BatchSize:           cfg.BatchSize,
@@ -84,7 +94,8 @@ func run() error {
 	}()
 
 	log.Info("worker starting", "id", w.ID(), "queues", cfg.Queues, "concurrency", cfg.Concurrency,
-		"lease", cfg.Lease.String(), "complete_batch", cfg.CompleteBatch, "complete_batch_linger", cfg.CompleteBatchLinger.String(), "types", reg.Types())
+		"lease", cfg.Lease.String(), "complete_batch", cfg.CompleteBatch, "complete_batch_linger", cfg.CompleteBatchLinger.String(),
+		"notify", cfg.Notify, "notify_fallback_poll", cfg.NotifyFallbackPoll.String(), "types", reg.Types())
 	runErr := w.Run(ctx)
 
 	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

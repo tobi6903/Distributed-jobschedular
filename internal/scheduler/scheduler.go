@@ -16,6 +16,9 @@ type Observer interface {
 	Fired(fired, skipped int)
 }
 
+// Notifier is told which queues received jobs, after the transaction that created them committed.
+type Notifier interface{ Notify(queue string) }
+
 type nopObserver struct{}
 
 func (nopObserver) Leader(bool)    {}
@@ -36,6 +39,7 @@ type Scheduler struct {
 	cfg    Config
 	log    *slog.Logger
 	obs    Observer
+	notify Notifier // optional
 	tracer trace.Tracer
 	leader atomic.Bool
 }
@@ -44,6 +48,9 @@ type Option func(*Scheduler)
 
 func WithObserver(o Observer) Option   { return func(s *Scheduler) { s.obs = o } }
 func WithTracer(t trace.Tracer) Option { return func(s *Scheduler) { s.tracer = t } }
+
+// WithNotifier wakes idle workers when a fire creates jobs (nil: workers find them by polling).
+func WithNotifier(n Notifier) Option { return func(s *Scheduler) { s.notify = n } }
 
 func New(store *Store, cfg Config, log *slog.Logger, opts ...Option) *Scheduler {
 	if cfg.Tick == 0 {
@@ -104,6 +111,11 @@ func (s *Scheduler) drain(ctx context.Context) {
 		if res.Fired+res.Skipped > 0 {
 			s.log.Info("fired schedules", "schedules", res.Schedules, "jobs_created", res.Fired, "duplicates_prevented", res.Skipped)
 			s.obs.Fired(res.Fired, res.Skipped)
+		}
+		if s.notify != nil {
+			for _, q := range res.Queues {
+				s.notify.Notify(q)
+			}
 		}
 		if res.Schedules < 100 {
 			return

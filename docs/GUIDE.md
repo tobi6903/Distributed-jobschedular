@@ -312,6 +312,32 @@ CPU is a poor signal for a queue worker (idle workers and a huge backlog can coe
 
 **The proof to point at.** `TestCompleteBatchIsFencedPerRow`, and the mutation check: deleting `AND j.attempts = r.attempts` makes it fail. Charts: [docs/perf](perf/README.md). Design: [DESIGN.md section 19](DESIGN.md#19-completion-batching-group-commit).
 
+### 3.14 The cached plan trap (a debugging story)
+
+**Symptom.** In a 60,000-job burst chart, two workers claimed far more than the other two for about 30 s.
+
+**What I did, and what I got wrong at first.** I wrote "not a metrics artifact, cause unknown". The investigation overturned both halves:
+
+1. **Ground truth first.** Each worker logs a line per finished job, so counting lines per worker per second gives numbers that do not pass through Prometheus. They showed perfectly even work in a reproduction while Prometheus showed one worker at 41 to 60% for 14 s. Cause: a series born at its first increment is invisible to `rate()` for a window (the same bug as the reaped counter). Fixed by creating series at zero.
+2. **But some bursts really were slow** (and then really uneven). The discriminating measurement was CPU: Postgres at about 400% while workers were at 2 to 3%, so the claim queries themselves were expensive.
+3. **Cause:** `pgx` prepared statements adopt a cached generic plan after five executions. A fresh worker polls an empty table, so its cached plan came from empty-table statistics and turned `UPDATE ... FROM picked` into a hash join over a sequential scan of all of `jobs`. It stays until autovacuum analyzes the table, which is why the slow phase ended abruptly after 30 to 55 s and only affected new workers.
+4. **Causal test:** 3 of 3 cold bursts fast with `plan_cache_mode=force_custom_plan`, 3 of 3 slow without. **Fix:** set it on every pooled connection. Median drain 61 s to 29 s.
+
+**What to say about the limits.** I never captured the bad plan itself in a slow run, and one run before the fix was fast, so the final link is inferred. I also rejected three hypotheses along the way (connections, checkpoints, stale statistics alone), and the first cause I tested (disabling autovacuum, manual `ANALYZE`) did not reproduce because those workers were long-lived. Interviewers like candidates who say what they ruled out. See [DESIGN.md section 20](DESIGN.md#20-the-cached-plan-trap-found-by-investigating-uneven-burst-claims).
+
+### 3.15 Wake-up notifications (LISTEN/NOTIFY)
+
+**Problem.** Idle workers find work only by polling, so a job submitted to an idle fleet waits up to a poll interval, and polling costs a query per worker per interval.
+
+**Design.** Workers `LISTEN`; the API and scheduler `NOTIFY` after a runnable job commits. A notification is **only a hint** that ends an idle sleep early: the worker runs the same `SKIP LOCKED` claim, and the poll remains, so a lost hint never loses a job. Two details are the interesting interview material:
+
+- **Coalescing.** `NOTIFY` takes a lock at commit that serializes every transaction that sent one, so a notification per insert (or a trigger) would queue the commits that already limit throughput. The publisher instead sends at most one per queue per 25 ms window, from its own statement after the commit: leading edge (a lone job notifies immediately) plus trailing edge (a burst shares one).
+- **What cannot be announced.** Delays and retries become runnable at a *future* time, and nothing can announce a future moment, so they ride the poll. The knob `WORKER_NOTIFY_FALLBACK_POLL` trades idle queries for lateness of those jobs: 10x fewer empty polls, but a retried job started up to 8.9 s late.
+
+**Numbers (one shared machine, 40 jobs per cell).** 2 idle workers: median pickup 377 ms to 9 ms. 8 workers: 69 ms to 7 ms, because independent timers already overlap; the tail (p95 273 ms to 9 ms) is the clearer win. Idle polls per second did not change without the fallback (8.0 vs 8.0). About 7 of 8 woken workers lose the race (288 empty wake-ups vs 41 productive). Submit throughput showed no detectable difference (1,548 vs 1,500 req/s median over 8 pairs; run-to-run noise about +/-30%, so not proof of zero).
+
+**Honest limits.** Reconnection is tested by killing the listener backend, not a real failover; behind a transaction-mode PgBouncer hints are not delivered while the worker still looks healthy, so do not raise the fallback there. Costs one connection per worker.
+
 ---
 
 ## 4. A guided tour of the code (read in this order)
@@ -321,6 +347,7 @@ CPU is a poor signal for a queue worker (idle workers and a huge backlog can coe
 3. [`internal/queue/store.go`](../internal/queue/store.go): every SQL statement. `claimSQL`, `fenced`, `Reap`, `Enqueue`. This is the heart; read it twice.
 4. [`internal/worker/worker.go`](../internal/worker/worker.go): `Run` → `pollLoop` → `claim` → `execute` → `heartbeat` / `invoke` / `finalize`. Note the context juggling (`jobCtx` vs the signal `ctx`, `context.Cause`).
 5. [`internal/queue/limits.go`](../internal/queue/limits.go) (limits: `claimLimited`, `Admit`), then [`internal/scheduler/cron.go`](../internal/scheduler/cron.go) `Plan`, then `store.go` `FireDue`, then `election.go`.
+   Optional extras, once the core is clear: [`internal/worker/completer.go`](../internal/worker/completer.go) (group commit, 3.13) and [`internal/queue/notify.go`](../internal/queue/notify.go) (the `Notifier` that publishes wake-up hints and the `Listener` that receives them, 3.15).
 6. [`internal/api/api.go`](../internal/api/api.go): handlers, validation, auth middleware, tracing middleware.
 7. [`cmd/*/main.go`](../cmd): how it all wires together; note how small they are.
 8. Tests, as a second view of the same logic: [`store_test.go`](../internal/queue/store_test.go), [`worker_test.go`](../internal/worker/worker_test.go) (fake store, fast), [`scale_test.go`](../test/integration/scale_test.go) (the headline test), [`scheduler_test.go`](../internal/scheduler/scheduler_test.go).
@@ -429,7 +456,7 @@ Run the real Postgres semantics (no mocks for `SKIP LOCKED`), run with `-race`, 
 So the database itself rejects impossible states (a `running` job with no lease). A bug in application code cannot produce them. A test confirms it.
 
 **Q: What would you change if you had another week?**
-`LISTEN/NOTIFY` to cut idle pickup latency; weighted fair shares and API request-rate limiting; priority aging; the outbox pattern so jobs can be enqueued transactionally from other services.
+weighted fair shares and API request-rate limiting; priority aging; the outbox pattern so jobs can be enqueued transactionally from other services.
 
 ---
 
@@ -477,7 +504,7 @@ Interviewers trust candidates who name their own weak points before being asked:
 - **Strict priority can starve** low-priority jobs.
 - **Handlers are in-process Go functions** with no sandboxing; a handler can still take down a worker (the attempt budget stops infinite crash loops).
 - **Completion batching is opt-in and only helps at scale** (+51% at 8 workers, nothing measurable at 1 to 4), and it did not remove the Postgres ceiling.
-- **Idle pickup latency** is up to the poll interval (no `LISTEN/NOTIFY` yet).
+- **Idle pickup latency** is up to the poll interval unless `LISTEN/NOTIFY` wake-ups are on (opt-in; retried and scheduled jobs are never announced, so they always wait for the poll).
 - **Never run against a managed cloud cluster**: it was verified on kind with an in-cluster demo Postgres, not against a cloud database, a real ingress controller or a secret manager. The GitHub Actions workflows were validated statically but have not run yet.
 
 ---

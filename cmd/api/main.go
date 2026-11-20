@@ -49,6 +49,12 @@ func run() error {
 
 	store := queue.New(pool)
 	m := metrics.New()
+	if cfg.Notify {
+		n := queue.NewNotifier(pool, cfg.NotifyWindow, m.NotifySent)
+		defer n.Close() // runs before pool.Close (LIFO): scheduled notifications still have a pool to use
+		store.SetNotifier(n)
+		log.Info("wake-up notifications enabled", "window", cfg.NotifyWindow.String())
+	}
 	srv := api.New(api.Deps{
 		Jobs: store, Auth: store, DB: pool, Schedules: scheduler.NewStore(pool),
 		Logger: log, Observer: m.APIObserver(),

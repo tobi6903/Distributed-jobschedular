@@ -8,7 +8,7 @@ The job-executing process. `main` wires config, the built-in demo handlers, metr
 DATABASE_URL=postgres://... WORKER_CONCURRENCY=20 ./bin/worker
 ```
 
-Key variables (full table: [docs/OPERATIONS.md](../../docs/OPERATIONS.md#components-and-configuration)): `WORKER_QUEUES` (default `default`), `WORKER_CONCURRENCY` (10), `WORKER_LEASE` (30s; heartbeat is lease/3), `WORKER_DEFAULT_TIMEOUT` (5m), `WORKER_SHUTDOWN_GRACE` (30s), `WORKER_REAP_INTERVAL` (10s), `WORKER_COMPLETE_BATCH` (false; group commit of success writes, see [Completion batching](../../docs/OPERATIONS.md#completion-batching)), `RETENTION` (168h), `BACKOFF_BASE`/`BACKOFF_CAP`, `DB_MAX_CONNS` (Compose/Helm: 20).
+Key variables (full table: [docs/OPERATIONS.md](../../docs/OPERATIONS.md#components-and-configuration)): `WORKER_QUEUES` (default `default`), `WORKER_CONCURRENCY` (10), `WORKER_LEASE` (30s; heartbeat is lease/3), `WORKER_DEFAULT_TIMEOUT` (5m), `WORKER_SHUTDOWN_GRACE` (30s), `WORKER_REAP_INTERVAL` (10s), `WORKER_COMPLETE_BATCH` (false; group commit of success writes, see [Completion batching](../../docs/OPERATIONS.md#completion-batching)), `WORKER_NOTIFY` (false; `LISTEN` for wake-ups so idle workers claim at once, one extra dedicated DB connection, see [Wake-up notifications](../../docs/OPERATIONS.md#wake-up-notifications)), `WORKER_NOTIFY_FALLBACK_POLL` (0 = `WORKER_POLL_INTERVAL`), `RETENTION` (168h), `BACKOFF_BASE`/`BACKOFF_CAP`, `DB_MAX_CONNS` (Compose/Helm: 20).
 
 ## Ops endpoint (`METRICS_ADDR`, default `:9100`)
 

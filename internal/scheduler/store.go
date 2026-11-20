@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -220,6 +221,9 @@ type FireResult struct {
 	Schedules int // schedules processed
 	Fired     int // jobs created
 	Skipped   int // jobs that already existed (idempotency hit): protection against double-fire
+	// Queues are the queues that received at least one new job, so the caller can wake idle workers once
+	// the transaction has committed.
+	Queues []string
 }
 
 // FireDue turns every due schedule into jobs, atomically per call.
@@ -292,6 +296,9 @@ func (s *Store) FireDue(ctx context.Context, cfg FireConfig) (FireResult, error)
 			}
 			if created {
 				res.Fired++
+				if !slices.Contains(res.Queues, sc.Queue) {
+					res.Queues = append(res.Queues, sc.Queue)
+				}
 			} else {
 				res.Skipped++
 			}

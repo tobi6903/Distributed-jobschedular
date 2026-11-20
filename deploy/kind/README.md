@@ -5,6 +5,8 @@ make docker-build IMAGE_TAG=dev REGISTRY=jobscheduler   # the four images (needs
 make kind-up          # 3-node kind cluster, metrics-server, KEDA, then the chart (demo Postgres)
 make k8s-verify       # autoscaling, crashes, rolling deploy, node drain, NetworkPolicy  (FULL=1 adds a 2.5 min test)
 make argocd-verify    # Argo CD deploys the chart from git, heals drift, rolls out, rolls back
+PUBLISHED=1 make argocd-verify   # same, but with the images CI pushed to GHCR (tag promoted on origin/main)
+make hpa-verify       # in-cluster load through the Service: API HPA scales out and the new pods take traffic
 make kind-down        # delete the cluster
 ```
 

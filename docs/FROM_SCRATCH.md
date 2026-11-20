@@ -183,6 +183,22 @@ Every job ends with a *durable commit* (the database waits for the disk). One da
 
 **What happened when we measured it:** commits per job fell about 3.5 times. Throughput rose 51% at 8 workers (3,997 to 6,054 jobs a second) but showed no gain at 1 to 4 workers. An earlier version that waited a fixed 5 milliseconds to fill batches was actually *slower* at 1 to 2 workers, so we removed the wait. It is switched off by default and you turn it on when you run many workers on one database.
 
+### Problem 7c: a burst on brand-new workers was strangely slow
+
+We noticed in a chart that two workers did far more than the other two for the first 30 seconds of a big burst. Investigating it taught the most useful debugging lesson in the project: we stopped trusting the chart and counted each worker's own log lines instead.
+
+That found **two separate things**. First, the chart was partly wrong: Prometheus under-reports a metric for the first seconds after it appears, so it made fair work look unfair (fixed: workers create their metrics at zero on startup). Second, and more important, some bursts were genuinely slow. During those, the database was using four CPU cores while the workers did almost nothing: the database was busy planning and running a bad query. A database remembers (caches) how it decided to run a query. A fresh worker asks its question every second while the table is empty, so the database remembers a plan that is perfect for an empty table and terrible for 60,000 rows, and keeps using it until it next refreshes its statistics, up to a minute later.
+
+The fix is one setting: always plan each query with its real values. A burst that took a median of 61 seconds now takes 29.
+
+### Problem 7d: an idle worker only notices new work when it next looks
+
+Workers find jobs by asking the database "anything for me?" about once a second. If the queue is empty and someone submits a job, it waits until some worker happens to ask again, so on average half a second goes by doing nothing. Asking more often fixes that but makes every idle worker hammer the database.
+
+The fix is to let the database **tap workers on the shoulder**. Postgres has a built-in feature for this, `LISTEN/NOTIFY`: each worker keeps one extra connection open that listens on a channel, and the API sends a short message on that channel after it has saved a job. The worker wakes up and asks for work straight away. Measured on two idle workers, the median wait fell from 377 ms to 9 ms.
+
+The important design rule is that **the tap on the shoulder is only a hint**. Messages can be lost (nobody listening, a dropped connection, a crash right after saving), so the worker still asks on a timer as before, and when it does ask it uses the same safe "take a job nobody else has" query. A lost hint just means the job is found a moment later, never lost. Three honest limits: with 8 workers polling at random times the baseline is already about 69 ms, so the gain is smaller on big fleets; hints do not reduce how often idle workers ask (only slowing the timer does that); and a job that is retried later or scheduled for later cannot be announced in advance, so slowing the timer too much makes those start late (up to 8.9 s in our test with a 10 s timer). It is off by default.
+
 ### Problem 8: running things on a schedule
 
 "Every night at 2am" needs something that watches the clock and creates jobs. Section 6 covers it.
@@ -504,16 +520,16 @@ Know the limits before someone else points them out.
 
 - **Exactly-once.** Impossible in general. It is at-least-once, and handlers must be idempotent.
 - **One database primary is the ceiling.** A few thousand jobs per second in our measurements, even with completion batching. Beyond that you shard queues across databases or move to a different design.
-- **Not verified on managed cloud.** It was proven on a local multi-node Kubernetes cluster (kind), not on a managed cloud service with a real ingress, an external database or real secret management. Rolling out the *published* images through Argo CD is also not yet exercised end to end.
-- **The API autoscaler** reads its metric correctly, but no test has pushed it over its target to watch it scale out.
-- **One thing observed and not explained:** during the burst test, two workers claimed far more than the other two for the first ~30 seconds. The total is correct, but the cause is unknown.
+- **Not verified on managed cloud.** It was proven on a local multi-node Kubernetes cluster (kind), not on a managed cloud service with a real ingress, an external database or real secret management. Rolling out the *published* images through Argo CD was exercised on kind (`PUBLISHED=1 make argocd-verify`), but with the git repo served inside the cluster rather than GitHub over HTTPS.
+- **Wake-up hints (`LISTEN/NOTIFY`)** are measured on one shared machine only. Reconnection was tested by killing the listener's connection, not by a real database failover, and behind a transaction-mode connection pooler the hints do not arrive (the timer still finds jobs, so nothing is lost, but the speed-up disappears).
+- **The API autoscaler** was pushed over its target on the kind cluster (`make hpa-verify`): it scaled 2 -> 4 replicas and the load spread across all four. Not tested: scaling down (the HPA waits 5 minutes), and scaling on a real cloud node pool where new nodes must also appear.
+- **A fixed bug found late:** a burst on freshly started workers used to run 2 to 3 times slower because of a cached query plan (Problem 7c). It is fixed and measured, but the slow runs never captured the plan itself, so that last link of the explanation is inferred from CPU use and an on/off experiment.
 - **Handlers are in-process Go functions**, not a separate language-agnostic worker protocol.
 
 **Natural next steps:**
 
 | Idea | What it buys |
 |---|---|
-| `LISTEN/NOTIFY` | Workers wake immediately instead of polling about once a second, cutting idle pickup latency |
 | **Outbox pattern** | Reliably publish events to other systems in the same transaction as a state change |
 | **Workflows (DAGs)** | "Run B and C after A, then D": the step towards a mini Temporal |
 | **A Kubernetes operator** | Declare queues and limits as Kubernetes resources |

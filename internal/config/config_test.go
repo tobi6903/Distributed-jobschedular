@@ -50,6 +50,43 @@ func TestLoadWorkerCompleteBatching(t *testing.T) {
 	}
 }
 
+func TestLoadNotify(t *testing.T) {
+	// Off by default everywhere: enabling it is a deliberate rollout (workers first, then producers).
+	w, err := LoadWorker(env(map[string]string{"DATABASE_URL": "x"}))
+	if err != nil || w.Notify || w.NotifyFallbackPoll != 0 {
+		t.Fatalf("worker must default to polling only: %+v %v", w, err)
+	}
+	a, err := LoadAPI(env(map[string]string{"DATABASE_URL": "x"}))
+	if err != nil || a.Notify || a.NotifyWindow != 25*time.Millisecond {
+		t.Fatalf("api defaults: %+v %v", a, err)
+	}
+	sc, err := LoadScheduler(env(map[string]string{"DATABASE_URL": "x"}))
+	if err != nil || sc.Notify || sc.NotifyWindow != 25*time.Millisecond {
+		t.Fatalf("scheduler defaults: %+v %v", sc, err)
+	}
+
+	w, err = LoadWorker(env(map[string]string{"DATABASE_URL": "x", "WORKER_NOTIFY": "true", "WORKER_NOTIFY_FALLBACK_POLL": "10s"}))
+	if err != nil || !w.Notify || w.NotifyFallbackPoll != 10*time.Second {
+		t.Fatalf("%+v %v", w, err)
+	}
+	a, err = LoadAPI(env(map[string]string{"DATABASE_URL": "x", "NOTIFY": "true", "NOTIFY_WINDOW": "50ms"}))
+	if err != nil || !a.Notify || a.NotifyWindow != 50*time.Millisecond {
+		t.Fatalf("%+v %v", a, err)
+	}
+	sc, err = LoadScheduler(env(map[string]string{"DATABASE_URL": "x", "NOTIFY": "1"}))
+	if err != nil || !sc.Notify {
+		t.Fatalf("%+v %v", sc, err)
+	}
+	if _, err = LoadWorker(env(map[string]string{"DATABASE_URL": "x", "WORKER_NOTIFY_FALLBACK_POLL": "-5s"})); err == nil ||
+		!strings.Contains(err.Error(), "WORKER_NOTIFY_FALLBACK_POLL") {
+		t.Fatalf("a negative fallback poll must be rejected: %v", err)
+	}
+	if _, err = LoadAPI(env(map[string]string{"DATABASE_URL": "x", "NOTIFY": "sometimes"})); err == nil ||
+		!strings.Contains(err.Error(), "NOTIFY") {
+		t.Fatalf("a bad boolean must be reported: %v", err)
+	}
+}
+
 func TestLoadErrors(t *testing.T) {
 	tests := []struct {
 		name string

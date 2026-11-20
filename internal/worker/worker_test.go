@@ -95,8 +95,20 @@ func (f *fakeStore) finalised() int {
 type obsRec struct {
 	mu       sync.Mutex
 	outcomes []string
+	wakeups  []bool
+	polls    []int // jobs returned by each claim query
 }
 
+func (o *obsRec) ClaimPoll(_ string, got int) {
+	o.mu.Lock()
+	o.polls = append(o.polls, got)
+	o.mu.Unlock()
+}
+func (o *obsRec) Wakeup(claimed bool) {
+	o.mu.Lock()
+	o.wakeups = append(o.wakeups, claimed)
+	o.mu.Unlock()
+}
 func (o *obsRec) Claimed(string, int, []time.Duration) {}
 func (o *obsRec) Finished(_, _, outcome string, _ time.Duration) {
 	o.mu.Lock()
@@ -433,5 +445,27 @@ func TestConfigDefaults(t *testing.T) {
 	if c.ID == "" || c.Concurrency != 10 || c.BatchSize != 10 || c.Lease != 30*time.Second ||
 		c.HeartbeatInterval != 10*time.Second || len(c.Queues) != 1 || c.Backoff.Base == 0 {
 		t.Fatalf("defaults: %+v", c)
+	}
+}
+
+type primerObs struct {
+	obsRec
+	queues, types []string
+}
+
+func (p *primerObs) Prime(queues, types []string) { p.queues, p.types = queues, types }
+
+// A worker tells a Primer observer which queues it polls and which job types it can run, before any event, so
+// metrics series exist at zero (see metrics.workerObserver.Prime).
+func TestNewPrimesObserver(t *testing.T) {
+	obs := &primerObs{}
+	r := NewRegistry()
+	_ = r.Register("a", func(context.Context, job.Job) error { return nil })
+	_ = r.Register("b", func(context.Context, job.Job) error { return nil })
+	cfg := testCfg()
+	cfg.Queues = []string{"q1", "q2"}
+	New(newFake(), r, cfg, quiet(), WithObserver(obs))
+	if len(obs.queues) != 2 || obs.queues[0] != "q1" || len(obs.types) != 2 {
+		t.Fatalf("Prime got queues=%v types=%v", obs.queues, obs.types)
 	}
 }

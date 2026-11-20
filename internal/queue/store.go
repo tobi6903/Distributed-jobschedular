@@ -28,13 +28,27 @@ var (
 
 // Store implements all job persistence on a pgx pool.
 type Store struct {
-	pool *pgxpool.Pool
-	lim  limiter
+	pool     *pgxpool.Pool
+	lim      limiter
+	notifier *Notifier // optional: wakes idle workers when a job becomes runnable
 }
 
 // New returns a Store backed by pool.
 func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool, lim: newLimiter()}
+}
+
+// SetNotifier makes Enqueue and Replay announce runnable jobs (see Notifier). Call it before serving;
+// nil (the default) means workers find new jobs by polling only.
+func (s *Store) SetNotifier(n *Notifier) { s.notifier = n }
+
+// announce hints that j can run now. Called only after the row is committed. A job that is not due soon
+// (a delay, a future run_at) is left to the poll: its wake-up time is in the future, so a notification
+// now would only wake workers to find nothing.
+func (s *Store) announce(j job.Job) {
+	if s.notifier != nil && !j.RunAt.After(time.Now().Add(time.Second)) {
+		s.notifier.Notify(j.Queue)
+	}
 }
 
 // Pool exposes the pool for components that share it (scheduler, API health checks).
@@ -110,6 +124,7 @@ func (s *Store) Enqueue(ctx context.Context, n job.NewJob) (j job.Job, created b
 	for attempt := 0; attempt < 2; attempt++ {
 		j, err = scanJob(s.pool.QueryRow(ctx, q, args...))
 		if err == nil {
+			s.announce(j)
 			return j, true, nil
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
@@ -389,6 +404,7 @@ func (s *Store) Replay(ctx context.Context, tenantID, id string) (job.Job, error
 		WHERE id = $1 AND tenant_id = $2 AND status IN ('failed', 'dead')
 		RETURNING `+jobColumns, id, tenantID))
 	if err == nil {
+		s.announce(j)
 		return j, nil
 	}
 	if isInvalidUUID(err) {

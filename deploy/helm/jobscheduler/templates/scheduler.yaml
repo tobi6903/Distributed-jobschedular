@@ -53,6 +53,10 @@ spec:
               value: {{ printf "%ds" (int .Values.scheduler.tickSeconds) | quote }}
             - name: SCHEDULER_ELECTION_RETRY
               value: {{ printf "%ds" (int .Values.scheduler.electionRetrySeconds) | quote }}
+            - name: NOTIFY
+              value: {{ .Values.notify.enabled | quote }}
+            - name: NOTIFY_WINDOW
+              value: {{ .Values.notify.window | quote }}
           livenessProbe:
             httpGet: {path: /healthz, port: metrics}
             periodSeconds: 15

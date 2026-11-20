@@ -117,6 +117,8 @@ func New(t testing.TB, maxConns int32) *pgxpool.Pool {
 	if maxConns > 0 {
 		cfg.MaxConns = maxConns
 	}
+	// Same plan_cache_mode as production pools (queue.Connect), so tests run the plans production runs.
+	cfg.ConnConfig.RuntimeParams["plan_cache_mode"] = "force_custom_plan"
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		t.Fatalf("pool: %v", err)

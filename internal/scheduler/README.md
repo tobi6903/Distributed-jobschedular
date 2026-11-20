@@ -9,6 +9,7 @@ Turns **cron schedules into jobs**, runs as 2+ replicas, and guarantees a schedu
 | [cron.go](cron.go) | `ParseSpec`, `Spec.Next` (timezone-aware), `Plan` (the misfire policy logic, a pure function), `MisfirePolicy` |
 | [store.go](store.go) | `Store`: schedule CRUD + `SetEnabled`, and `FireDue` (the fire transaction), `FireKey` |
 | [election.go](election.go) | `Elector`: leader election with a Postgres session advisory lock |
+| [scheduler.go](scheduler.go) | (see also `WithNotifier`: after a fire commits, the queues that received jobs are announced so idle workers wake at once) |
 | [scheduler.go](scheduler.go) | `Scheduler`: the loop that ties election and `FireDue` together; `Observer` for metrics |
 
 ## Misfire policies

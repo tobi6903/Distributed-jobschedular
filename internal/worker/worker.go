@@ -61,6 +61,12 @@ type Observer interface {
 	Deleted(n int)
 	// CompleteBatch reports one flush of batched success writes (size = jobs in the statement).
 	CompleteBatch(size int)
+	// ClaimPoll reports one claim query against a queue and how many jobs it returned (0 = an empty poll).
+	// Empty polls are the idle load a worker puts on the database.
+	ClaimPoll(queue string, got int)
+	// Wakeup reports that an idle worker was woken by a notification, and whether the claim it triggered
+	// found work (false = it lost the race to another worker, or the hint was stale).
+	Wakeup(claimed bool)
 }
 
 type nopObserver struct{}
@@ -69,15 +75,36 @@ func (nopObserver) Claimed(string, int, []time.Duration)           {}
 func (nopObserver) Finished(string, string, string, time.Duration) {}
 func (nopObserver) Reaped(int, int)                                {}
 func (nopObserver) CompleteBatch(int)                              {}
+func (nopObserver) Wakeup(bool)                                    {}
+func (nopObserver) ClaimPoll(string, int)                          {}
 func (nopObserver) Deleted(int)                                    {}
+
+// Primer is an optional Observer extension: it is told which queues and job types this worker serves so it can
+// create their series before the first event (see metrics.workerObserver.Prime).
+type Primer interface {
+	Prime(queues, types []string)
+}
+
+// WakeSource tells an idle worker that work may be available now, ahead of its next poll. It is a hint:
+// the worker still claims with the same query, and still polls (see Config.FallbackPoll).
+type WakeSource interface {
+	Wake() <-chan struct{} // a value means "look now"; many hints coalesce into one
+	Healthy() bool         // false while the source cannot deliver hints (the worker then polls normally)
+}
 
 // Config tunes a worker. Zero values are replaced by defaults (see withDefaults).
 type Config struct {
-	ID                string        // unique per process; stored in locked_by
-	Queues            []string      // polled in order: earlier queues have strict priority
-	Concurrency       int           // max jobs executing at once
-	BatchSize         int           // max jobs claimed per round trip
-	PollInterval      time.Duration // idle sleep between empty polls (jittered)
+	ID           string        // unique per process; stored in locked_by
+	Queues       []string      // polled in order: earlier queues have strict priority
+	Concurrency  int           // max jobs executing at once
+	BatchSize    int           // max jobs claimed per round trip
+	PollInterval time.Duration // idle sleep between empty polls (jittered)
+	// Wake, if set, ends an idle sleep early when a notification arrives (nil: poll only).
+	Wake WakeSource
+	// FallbackPoll is the idle sleep while Wake is healthy: the polling that remains is only a safety net
+	// for lost notifications, and the only way to find delayed and retried jobs (nothing announces those).
+	// Default PollInterval, so enabling Wake never makes pickup slower; raise it to cut idle queries.
+	FallbackPoll      time.Duration
 	Lease             time.Duration // visibility timeout
 	HeartbeatInterval time.Duration // must be well under Lease; default Lease/3
 	DefaultTimeout    time.Duration // per-job timeout when the job has none
@@ -115,6 +142,7 @@ func (c Config) withDefaults() Config {
 		c.BatchSize = c.Concurrency
 	}
 	def(&c.PollInterval, time.Second)
+	def(&c.FallbackPoll, c.PollInterval)
 	def(&c.Lease, 30*time.Second)
 	def(&c.HeartbeatInterval, c.Lease/3)
 	def(&c.DefaultTimeout, 5*time.Minute)
@@ -171,6 +199,9 @@ func New(store Store, reg *Registry, cfg Config, opts ...Option) *Worker {
 		o(w)
 	}
 	w.log = w.log.With("worker_id", w.cfg.ID)
+	if p, ok := w.obs.(Primer); ok {
+		p.Prime(w.cfg.Queues, reg.Types())
+	}
 	return w
 }
 
@@ -246,6 +277,7 @@ type claimedJob struct {
 }
 
 func (w *Worker) pollLoop(ctx, jobCtx context.Context, sem chan struct{}, inflight *sync.WaitGroup) {
+	woken := false // the previous idle wait was ended by a notification
 	for ctx.Err() == nil {
 		// Block until at least one execution slot is free, then grab as many more as are
 		// immediately available (up to BatchSize) so we claim exactly what we can run.
@@ -277,10 +309,37 @@ func (w *Worker) pollLoop(ctx, jobCtx context.Context, sem chan struct{}, inflig
 				w.execute(jobCtx, c)
 			}()
 		}
+		if woken {
+			w.obs.Wakeup(len(claimed) > 0)
+			woken = false
+		}
 		if err != nil || len(claimed) == 0 {
-			w.sleep(ctx, w.cfg.PollInterval)
+			woken = w.idle(ctx, err != nil)
 		}
 	}
+}
+
+// idle waits for the next claim attempt and reports whether a notification (not the timer) ended the wait.
+// While the wake source is healthy the timer is only a safety net (FallbackPoll); after an error, or while
+// the source is down, the normal PollInterval applies.
+func (w *Worker) idle(ctx context.Context, failed bool) (woken bool) {
+	d := w.cfg.PollInterval
+	var wake <-chan struct{}
+	if w.cfg.Wake != nil {
+		wake = w.cfg.Wake.Wake()
+		if !failed && w.cfg.Wake.Healthy() {
+			d = w.cfg.FallbackPoll
+		}
+	}
+	t := time.NewTimer(time.Duration(float64(d) * (0.8 + 0.4*w.rng.Float64())))
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	case <-wake: // nil channel (no wake source) blocks forever, so this case is simply never taken
+		return true
+	}
+	return false
 }
 
 // claim fills up to n slots, polling queues in configured order.
@@ -302,6 +361,8 @@ func (w *Worker) claim(ctx context.Context, n int) ([]claimedJob, error) {
 			w.log.Error("claim failed", "queue", q, "err", err)
 			return out, err
 		}
+		w.obs.ClaimPoll(q, len(jobs))
+		w.log.Debug("claimed", "queue", q, "asked", n-len(out), "got", len(jobs), "took_ms", float64(end.Sub(start).Microseconds())/1000)
 		if len(jobs) > 0 {
 			lats := make([]time.Duration, len(jobs))
 			for i, j := range jobs {
@@ -377,7 +438,8 @@ func (w *Worker) execute(parent context.Context, c claimedJob) {
 	if outcome != OutcomeSucceeded {
 		span.SetStatus(codes.Error, outcome)
 	}
-	log.Info("job finished", "outcome", outcome, "duration_ms", float64(dur.Microseconds())/1000)
+	log.Info("job finished", "outcome", outcome, "duration_ms", float64(dur.Microseconds())/1000,
+		"pickup_ms", float64(j.PickupLatency.Microseconds())/1000)
 }
 
 // invoke runs the handler, converting panics into errors so one bad job cannot kill the worker.
@@ -534,17 +596,6 @@ func (w *Worker) maintenance(ctx context.Context) {
 				}
 			}
 		}
-	}
-}
-
-// sleep waits d (+/-20% jitter, so a fleet started together does not poll in lockstep).
-func (w *Worker) sleep(ctx context.Context, d time.Duration) {
-	j := time.Duration(float64(d) * (0.8 + 0.4*w.rng.Float64()))
-	t := time.NewTimer(j)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-	case <-t.C:
 	}
 }
 

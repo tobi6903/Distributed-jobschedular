@@ -55,6 +55,10 @@ spec:
               value: {{ printf "%ds" (int .Values.api.shutdownDelaySeconds) | quote }}
             - name: SHUTDOWN_TIMEOUT
               value: {{ printf "%ds" (int .Values.api.shutdownTimeoutSeconds) | quote }}
+            - name: NOTIFY
+              value: {{ .Values.notify.enabled | quote }}
+            - name: NOTIFY_WINDOW
+              value: {{ .Values.notify.window | quote }}
           # Liveness never touches the database (a DB outage must not restart healthy pods).
           livenessProbe:
             httpGet: {path: /healthz, port: http}
