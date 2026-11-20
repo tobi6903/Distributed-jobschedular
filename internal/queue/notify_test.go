@@ -113,9 +113,12 @@ func TestListenerReconnectsAndSignalsAfterConnectionLoss(t *testing.T) {
 	pool := testdb.New(t, 10)
 	l := startListener(t, pool, "default")
 
+	// Only THIS test's database. CI runs every package in parallel against one Postgres server, and an unscoped
+	// kill terminated the LISTEN sessions of other packages' tests (the integration notify test then saw its jobs
+	// wait out the listener's 1 s reconnect backoff and failed).
 	if _, err := pool.Exec(context.Background(), `
 		SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-		WHERE query LIKE 'LISTEN%' AND pid <> pg_backend_pid()`); err != nil {
+		WHERE query LIKE 'LISTEN%' AND datname = current_database() AND pid <> pg_backend_pid()`); err != nil {
 		t.Fatal(err)
 	}
 	waitUntil(t, "listener to notice the lost connection", func() bool { return !l.Healthy() })
